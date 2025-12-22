@@ -18,6 +18,8 @@ struct Cli {
     #[arg(long, default_value = "data/visited.jsonl")]
     db: PathBuf,
     #[arg(long)]
+    reset_db: bool,
+    #[arg(long)]
     out: Option<PathBuf>,
     #[arg(long, default_value_t = 20)]
     max_per_source: usize,
@@ -68,6 +70,10 @@ fn main() -> Result<()> {
     }
     if let Some(parent) = cli.db.parent() {
         fs::create_dir_all(parent).context("create data directory")?;
+    }
+
+    if cli.reset_db {
+        reset_db(&cli.db)?;
     }
 
     let mut visited = load_visited(&cli.db)?;
@@ -164,6 +170,12 @@ fn load_visited(path: &Path) -> Result<HashSet<String>> {
         }
     }
     Ok(visited)
+}
+
+fn reset_db(path: &Path) -> Result<()> {
+    let mut file = File::create(path).with_context(|| format!("reset visited db {}", path.display()))?;
+    file.flush().context("flush reset db")?;
+    Ok(())
 }
 
 fn fetch_source(client: &Client, source: &Source) -> Result<Vec<Item>> {

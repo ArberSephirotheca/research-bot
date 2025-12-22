@@ -12,6 +12,7 @@ cargo run -- --config data/sources.yml --db data/visited.jsonl
 ```
 
 3) Read the report in `reports/YYYY-MM-DD.md`.
+4) To clear the dedupe database for a fresh run, add `--reset-db`.
 
 ## GitHub Actions
 
@@ -41,4 +42,5 @@ sources:
 ## Notes
 
 - The report shows up to `--max-per-source` items per source, but the visited DB tracks all new items so they do not repeat.
+- Use `--reset-db` to clear `data/visited.jsonl` before a run if you need to re-ingest everything.
 - When you add features or directories, update the corresponding README so agents can reorient quickly.
