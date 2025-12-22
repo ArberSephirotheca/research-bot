@@ -1,0 +1,5 @@
+sources:
+  - name: "arXiv: GPU OR CUDA"
+    url: "http://export.arxiv.org/api/query?search_query=all:GPU+OR+all:CUDA&start=0&max_results=50"
+  - name: "arXiv: ML + GPU"
+    url: "http://export.arxiv.org/api/query?search_query=cat:cs.LG+AND+all:GPU&start=0&max_results=50"
