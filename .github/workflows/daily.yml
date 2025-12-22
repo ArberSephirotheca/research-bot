@@ -11,6 +11,7 @@ permissions:
 jobs:
   digest:
     runs-on: ubuntu-latest
+    environment: openai
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,8 +19,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Guard OpenAI key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "${OPENAI_API_KEY}" ]]; then
+            echo "OPENAI_API_KEY is not set. Add it as a repo or environment secret."
+            exit 1
+          fi
+          echo "::add-mask::$OPENAI_API_KEY"
+
       - name: Run digest
-        run: cargo run -- --config data/sources.yml --db data/visited.jsonl
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: cargo run -- --config data/sources.yml --db data/visited.jsonl --summarize --discover
 
       - name: Commit and push
         run: |

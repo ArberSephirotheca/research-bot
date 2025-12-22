@@ -3,3 +3,7 @@ sources:
     url: "http://export.arxiv.org/api/query?search_query=all:GPU+OR+all:CUDA&start=0&max_results=50"
   - name: "arXiv: ML + GPU"
     url: "http://export.arxiv.org/api/query?search_query=cat:cs.LG+AND+all:GPU&start=0&max_results=50"
+  - name: "arXiv: Matrix Multiplication + GPU"
+    url: "http://export.arxiv.org/api/query?search_query=(all:GPU+OR+all:CUDA)+AND+(all:matrix+multiplication+OR+all:GEMM+OR+all:matmul)&start=0&max_results=50"
+  - name: "arXiv: AI/ML + GPU"
+    url: "http://export.arxiv.org/api/query?search_query=(cat:cs.AI+OR+cat:cs.LG)+AND+(all:GPU+OR+all:CUDA+OR+all:accelerator)&start=0&max_results=50"

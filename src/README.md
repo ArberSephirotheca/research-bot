@@ -4,6 +4,6 @@ Rust CLI that fetches GPU-related feeds, generates a daily digest, and updates t
 
 ## Key pieces
 
-- CLI args: config path, visited DB path, output path, per-source report limit, and `--reset-db` to clear the visited file.
+- CLI args: config path, visited DB path, output path, per-source report limit, `--max-age-days` window, `--reset-db` to clear the visited file, `--summarize` for OpenAI summaries (requires `OPENAI_API_KEY`), `--discover` for OpenAI web_search, and `--discovery-config` to point at a different discovery file. Local `.env` is auto-loaded.
 - Feed parsing: uses `feed-rs` to parse RSS/Atom.
 - Deduping: URLs are stored in `data/visited.jsonl` to avoid repeats.

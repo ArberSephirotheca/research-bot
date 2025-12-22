@@ -1,0 +1,19 @@
+topics:
+  - GPU architecture
+  - CUDA
+  - matrix multiplication
+  - GEMM
+  - matmul
+  - tensor cores
+  - CUTLASS
+  - cuBLAS
+  - Triton
+  - FlashAttention
+  - systolic array
+  - GPU compiler
+  - kernel fusion
+  - AI accelerators
+  - ML training
+  - GPU kernels
+max_queries: 8
+max_results_per_query: 10
