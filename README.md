@@ -39,6 +39,67 @@ cargo run -- --config data/sources.yml --db data/visited.jsonl --discover --summ
 
 Tune discovery topics and limits in `data/discovery.yml`.
 
+## Discord RAG bot
+
+This repo also includes a Discord bot that answers `/ask` using full-text papers.
+
+### Setup
+
+1) Put PDFs under `papers/`.
+2) Build embeddings (PDFs + reports):
+
+```bash
+python scripts/download_papers.py --reports-dir reports --out-dir papers
+python scripts/rag_ingest.py --input-dir papers --reports-dir reports
+```
+
+Omit `--reports-dir` if you only want PDFs.
+
+3) Run the bot:
+
+```bash
+cargo run --bin discord_bot
+```
+
+The bot logs each `/ask` request to stdout and appends a `Context:` line in its replies to show whether it used dataset chunks (plus top sources) or had no context.
+`/ask_paper` title matching is built from the report markdown files in `REPORTS_DIR`.
+Per-paper summaries are cached under `RAG_PAPER_SUMMARY_CACHE_DIR` to speed up repeat queries.
+Use `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` to expire cached summaries (0 disables expiry).
+
+### Commands
+
+- `/ask question:...` answers using top-K retrieved chunks.
+- `/ask_paper paper:... question:...` answers from the full paper via map-reduce. `paper` can be a filename, substring of the source path (for example `2512.04226v1.pdf`), or a report title (for example `tritonBLAS`).
+
+### Required env
+
+```
+DISCORD_TOKEN=your-bot-token
+GUILD_ID=your-guild-id
+APPLICATION_ID=your-application-id
+OPENAI_API_KEY=your-openai-key
+```
+
+Optional:
+
+```
+OPENAI_CHAT_MODEL=gpt-5.2
+OPENAI_EMBED_MODEL=text-embedding-3-small
+OPENAI_BASE_URL=https://api.openai.com/v1
+RAG_EMBEDDINGS_PATH=rag/embeddings.jsonl
+REPORTS_DIR=reports
+RAG_TOP_K=12
+RAG_MAX_CONTEXT_CHARS=8000
+RAG_PAPER_MAP_MAX_CHARS=6000
+RAG_PAPER_REDUCE_MAX_CHARS=12000
+RAG_PAPER_MAP_CONCURRENCY=3
+RAG_PAPER_SUMMARY_CACHE_DIR=rag/paper_summaries
+RAG_PAPER_SUMMARY_CACHE_TTL_SECS=604800
+ASK_MAX_RESPONSE_CHARS=1800
+```
+
+You can place these in `.env` for local runs.
+
 ## Secrets setup
 
 GitHub Actions reads `OPENAI_API_KEY` from secrets. Prefer the environment secret so you can gate runs:
@@ -66,6 +127,9 @@ Use a dedicated OpenAI key with strict spend limits to reduce blast radius.
 
 - `src/` Rust CLI implementation
 - `data/` source configuration + visited database + discovery config
+- `papers/` full-text PDFs for RAG ingestion
+- `rag/` chunk + embedding outputs
+- `scripts/` ingestion helpers
 - `reports/` daily digests (generated)
 - `.github/workflows/` scheduled GitHub Actions run
 
