@@ -15,7 +15,9 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serenity::{
-    async_trait, Client,
+    async_trait,
+    builder::{AutocompleteChoice, CreateAutocompleteResponse},
+    Client,
     all::{
         ApplicationId, CommandDataOptionValue, CommandInteraction, CommandOptionType,
         Context as DiscordContext,
@@ -124,6 +126,13 @@ struct TitleEntry {
     normalized: String,
     source: Option<String>,
     arxiv_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct AutocompleteCandidate {
+    score: usize,
+    name: String,
+    value: String,
 }
 
 struct TitleIndex {
@@ -250,16 +259,28 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: DiscordContext, interaction: Interaction) {
-        if let Interaction::Command(command) = interaction {
-            if command.data.name == "ask" {
-                if let Err(err) = handle_ask(&ctx, &command, self.state.clone()).await {
-                    eprintln!("Ask handler error: {err}");
-                }
-            } else if command.data.name == "ask_paper" {
-                if let Err(err) = handle_ask_paper(&ctx, &command, self.state.clone()).await {
-                    eprintln!("Ask paper handler error: {err}");
+        match interaction {
+            Interaction::Command(command) => {
+                if command.data.name == "ask" {
+                    if let Err(err) = handle_ask(&ctx, &command, self.state.clone()).await {
+                        eprintln!("Ask handler error: {err}");
+                    }
+                } else if command.data.name == "ask_paper" {
+                    if let Err(err) = handle_ask_paper(&ctx, &command, self.state.clone()).await {
+                        eprintln!("Ask paper handler error: {err}");
+                    }
                 }
             }
+            Interaction::Autocomplete(command) => {
+                if command.data.name == "ask_paper" {
+                    if let Err(err) =
+                        handle_paper_autocomplete(&ctx, &command, self.state.clone()).await
+                    {
+                        eprintln!("Autocomplete handler error: {err}");
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -286,7 +307,8 @@ fn build_ask_paper_command() -> CreateCommand {
                 "paper",
                 "Paper filename or substring of the source path",
             )
-            .required(true),
+            .required(true)
+            .set_autocomplete(true),
         )
         .add_option(
             CreateCommandOption::new(
@@ -348,11 +370,17 @@ async fn handle_ask(
             "ask: user={} channel={} context=none",
             command.user.id, command.channel_id
         );
+        let response = format_reply(
+            &question,
+            None,
+            "No relevant context found in the RAG index.",
+            "Context: none.",
+            state.config.ask_max_response_chars,
+        );
         command
             .edit_response(
                 &ctx.http,
-                EditInteractionResponse::new()
-                    .content("No relevant context found in the RAG index. Context: none."),
+                EditInteractionResponse::new().content(response),
             )
             .await?;
         return Ok(());
@@ -387,7 +415,9 @@ Context:\n{context}\n\nQuestion: {question}\nAnswer:",
         }
     };
     let context_note = build_context_note(&matches);
-    let response = append_context_note(
+    let response = format_reply(
+        &question,
+        None,
         &answer,
         &context_note,
         state.config.ask_max_response_chars,
@@ -650,8 +680,13 @@ Paper summary:\n{summary}\n\nQuestion: {question}\nAnswer:",
         }
     };
 
-    let context_note = build_paper_context_note(&source, chunks.len(), sections.len());
-    let response = append_context_note(
+    let title = title_for_source(&state.title_index, &source);
+    let context_note =
+        build_paper_context_note(&source, title.as_deref(), chunks.len(), sections.len());
+    let question_label = paper_label_for_question(title.as_deref(), &source);
+    let response = format_reply(
+        &question,
+        question_label.as_deref(),
         &answer,
         &context_note,
         state.config.ask_max_response_chars,
@@ -660,6 +695,28 @@ Paper summary:\n{summary}\n\nQuestion: {question}\nAnswer:",
         .edit_response(&ctx.http, EditInteractionResponse::new().content(response))
         .await
         .context("edit response")?;
+    Ok(())
+}
+
+async fn handle_paper_autocomplete(
+    ctx: &DiscordContext,
+    command: &CommandInteraction,
+    state: Arc<BotState>,
+) -> Result<()> {
+    let Some(option) = command.data.autocomplete() else {
+        return Ok(());
+    };
+    if option.name != "paper" {
+        return Ok(());
+    }
+    let choices = build_paper_autocomplete_choices(&state, option.value);
+    let response = CreateInteractionResponse::Autocomplete(
+        CreateAutocompleteResponse::new().set_choices(choices),
+    );
+    command
+        .create_response(&ctx.http, response)
+        .await
+        .context("send autocomplete response")?;
     Ok(())
 }
 
@@ -724,6 +781,141 @@ fn normalize_title(value: &str) -> String {
         }
     }
     out
+}
+
+fn build_paper_autocomplete_choices(
+    state: &BotState,
+    query: &str,
+) -> Vec<AutocompleteChoice> {
+    let query = query.trim();
+    let query_norm = normalize_title(query);
+    let query_lower = query.to_lowercase();
+
+    let mut candidates: BTreeMap<String, AutocompleteCandidate> = BTreeMap::new();
+
+    for entry in &state.title_index.entries {
+        let title = entry.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let score_title = score_match(&entry.normalized, &query_norm);
+        let score_source = entry
+            .source
+            .as_deref()
+            .and_then(|source| score_match(&source.to_lowercase(), &query_lower));
+        let score = match (score_title, score_source) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some(score) = score else {
+            continue;
+        };
+        let display = format_autocomplete_title(entry);
+        let name = truncate_choice(&display, 100);
+        let value = truncate_choice(title, 100);
+        if value.is_empty() {
+            continue;
+        }
+        insert_candidate(
+            &mut candidates,
+            AutocompleteCandidate {
+                score,
+                name,
+                value,
+            },
+        );
+    }
+
+    if !query_lower.is_empty() {
+        let mut sources = BTreeSet::new();
+        for chunk in &state.rag_index.chunks {
+            if let Some(source) = chunk.source.as_ref() {
+                sources.insert(source.clone());
+            }
+        }
+        for source in sources {
+            if !source_matches_query(&source, &query_lower) {
+                continue;
+            }
+            let display = format!("{} — source", source);
+            let name = truncate_choice(&display, 100);
+            let value = truncate_choice(&source, 100);
+            if value.is_empty() {
+                continue;
+            }
+            insert_candidate(
+                &mut candidates,
+                AutocompleteCandidate {
+                    score: 2,
+                    name,
+                    value,
+                },
+            );
+        }
+    }
+
+    let mut values: Vec<AutocompleteCandidate> = candidates.into_values().collect();
+    values.sort_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    values
+        .into_iter()
+        .take(25)
+        .map(|candidate| AutocompleteChoice::new(candidate.name, candidate.value))
+        .collect()
+}
+
+fn insert_candidate(
+    candidates: &mut BTreeMap<String, AutocompleteCandidate>,
+    candidate: AutocompleteCandidate,
+) {
+    match candidates.get(&candidate.value) {
+        Some(existing) if existing.score <= candidate.score => {}
+        _ => {
+            candidates.insert(candidate.value.clone(), candidate);
+        }
+    }
+}
+
+fn score_match(haystack: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(10);
+    }
+    if haystack.starts_with(query) {
+        return Some(0);
+    }
+    if haystack.contains(query) {
+        return Some(1);
+    }
+    None
+}
+
+fn truncate_choice(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn format_autocomplete_title(entry: &TitleEntry) -> String {
+    if let Some(source) = entry.source.as_deref() {
+        if let Some(name) = Path::new(source).file_name().and_then(|name| name.to_str()) {
+            return format!("{} — {}", entry.title, name);
+        }
+        return format!("{} — {}", entry.title, source);
+    }
+    if let Some(arxiv_id) = entry.arxiv_id.as_deref() {
+        return format!("{} — arXiv {}", entry.title, arxiv_id);
+    }
+    entry.title.clone()
 }
 
 fn format_title_candidate(entry: &TitleEntry) -> String {
@@ -1131,11 +1323,48 @@ Use short bullet points.\n\nSummaries:\n{combined}\n\nCondensed summary:",
     ))
 }
 
-fn build_paper_context_note(source: &str, chunk_count: usize, section_count: usize) -> String {
-    format!(
-        "Context: paper {} (chunks: {}, sections: {})",
-        source, chunk_count, section_count
-    )
+fn title_for_source(title_index: &TitleIndex, source: &str) -> Option<String> {
+    title_index
+        .entries
+        .iter()
+        .find_map(|entry| {
+            if entry.source.as_deref() == Some(source) {
+                Some(entry.title.clone())
+            } else {
+                None
+            }
+        })
+}
+
+fn paper_label_for_question(title: Option<&str>, source: &str) -> Option<String> {
+    if let Some(title) = title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+}
+
+fn build_paper_context_note(
+    source: &str,
+    title: Option<&str>,
+    chunk_count: usize,
+    section_count: usize,
+) -> String {
+    match title {
+        Some(title) => format!(
+            "Context: paper {} (source: {}; chunks: {}; sections: {})",
+            title, source, chunk_count, section_count
+        ),
+        None => format!(
+            "Context: paper {} (chunks: {}, sections: {})",
+            source, chunk_count, section_count
+        ),
+    }
 }
 
 fn build_context_note(matches: &[&RagChunk]) -> String {
@@ -1157,15 +1386,54 @@ fn build_context_note(matches: &[&RagChunk]) -> String {
     note
 }
 
-fn append_context_note(answer: &str, note: &str, max: usize) -> String {
-    let separator = "\n\n";
-    let note_len = separator.len() + note.len();
-    if note_len >= max {
-        return truncate_text(note, max);
+fn format_reply(
+    question: &str,
+    paper_label: Option<&str>,
+    answer: &str,
+    context_note: &str,
+    max: usize,
+) -> String {
+    let question = truncate_text(question.trim(), 400);
+    let paper = paper_label
+        .and_then(|label| {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncated_label(trimmed))
+            }
+        })
+        .unwrap_or_else(|| "n/a".to_string());
+    let mut context = context_note.trim();
+    if let Some(stripped) = context.strip_prefix("Context:") {
+        context = stripped.trim();
     }
-    let max_answer = max - note_len;
-    let trimmed_answer = truncate_text(answer, max_answer);
-    format!("{trimmed_answer}{separator}{note}")
+    if context.is_empty() {
+        context = "none";
+    }
+    let context = truncate_text(context, 600);
+
+    let question = if question.is_empty() {
+        "n/a".to_string()
+    } else {
+        question
+    };
+    let answer = answer.trim();
+    let header = format!("### Paper\n{paper}\n\n### Question\n{question}\n\n### Answer\n");
+    let footer = format!("\n\n### Context\n{context}");
+    if header.len() + footer.len() >= max {
+        let combined = format!(
+            "### Paper\n{paper}\n\n### Question\n{question}\n\n### Answer\n\n### Context\n{context}"
+        );
+        return truncate_text(&combined, max);
+    }
+    let max_answer = max.saturating_sub(header.len() + footer.len());
+    let answer = truncate_text(answer, max_answer);
+    format!("{header}{answer}{footer}")
+}
+
+fn truncated_label(label: &str) -> String {
+    truncate_text(label, 200)
 }
 
 fn truncate_text(text: &str, max: usize) -> String {

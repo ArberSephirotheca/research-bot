@@ -61,7 +61,7 @@ Omit `--reports-dir` if you only want PDFs.
 cargo run --bin discord_bot
 ```
 
-The bot logs each `/ask` request to stdout and appends a `Context:` line in its replies to show whether it used dataset chunks (plus top sources) or had no context.
+The bot logs each `/ask` request to stdout and replies with section headings for Paper, Question, Answer, and Context. `/ask_paper` includes the paper title when available.
 `/ask_paper` title matching is built from the report markdown files in `REPORTS_DIR`.
 Per-paper summaries are cached under `RAG_PAPER_SUMMARY_CACHE_DIR` to speed up repeat queries.
 Use `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` to expire cached summaries (0 disables expiry).
@@ -70,6 +70,7 @@ Use `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` to expire cached summaries (0 disables ex
 
 - `/ask question:...` answers using top-K retrieved chunks.
 - `/ask_paper paper:... question:...` answers from the full paper via map-reduce. `paper` can be a filename, substring of the source path (for example `2512.04226v1.pdf`), or a report title (for example `tritonBLAS`).
+- The `paper` option supports Discord autocomplete with title and source suggestions.
 
 ### Required env
 
