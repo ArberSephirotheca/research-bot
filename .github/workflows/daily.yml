@@ -32,7 +32,7 @@ jobs:
       - name: Run digest
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: cargo run -- --config data/sources.yml --db data/visited.jsonl --summarize --discover
+        run: cargo run --bin research-bot -- --config data/sources.yml --db data/visited.jsonl --summarize --discover
 
       - name: Commit and push
         run: |
