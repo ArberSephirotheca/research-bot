@@ -158,6 +158,7 @@ max_results_per_query: 5
 ## Notes
 
 - The report shows up to `--max-per-source` items per source, but the visited DB tracks all new items so they do not repeat.
+- Report items include authors and affiliations when available from the feed.
 - `--max-age-days` filters out items older than the window; entries without dates are skipped.
 - `--summarize` calls OpenAI to produce 2-3 bullet summaries per item. Requires `OPENAI_API_KEY`.
 - `--discover` enables hybrid web search using OpenAI web_search. Requires `OPENAI_API_KEY`.

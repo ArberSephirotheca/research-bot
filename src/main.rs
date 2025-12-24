@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -66,6 +66,8 @@ struct Item {
     published: Option<String>,
     abstract_text: Option<String>,
     summary: Option<String>,
+    authors: Vec<String>,
+    affiliations: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -372,6 +374,8 @@ fn fetch_source(client: &Client, source: &Source, cutoff: DateTime<Utc>) -> Resu
         .error_for_status()
         .with_context(|| format!("bad status for {}", source.url))?;
     let bytes = resp.bytes().context("read response body")?;
+    let raw_xml = String::from_utf8_lossy(&bytes);
+    let affiliations_by_id = extract_affiliations_by_id(&raw_xml);
     let feed = parser::parse(&bytes[..]).context("parse feed")?;
 
     let mut items = Vec::new();
@@ -408,12 +412,25 @@ fn fetch_source(client: &Client, source: &Source, cutoff: DateTime<Utc>) -> Resu
         let abstract_text = extract_abstract(&entry)
             .as_deref()
             .map(normalize_text);
+        let authors = entry
+            .authors
+            .iter()
+            .map(|person| person.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        let affiliations = affiliations_by_id
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_default();
         items.push(Item {
             title,
             url,
             published,
             abstract_text,
             summary: None,
+            authors,
+            affiliations,
         });
     }
     Ok(items)
@@ -443,6 +460,97 @@ fn normalize_text(input: &str) -> String {
         }
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_affiliations_by_id(xml: &str) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
+    let mut cursor = 0;
+    while let Some((entry_block, next)) = next_xml_block(xml, "entry", cursor) {
+        cursor = next;
+        let Some(id) = extract_first_tag_text(&entry_block, "id") else {
+            continue;
+        };
+        let mut affiliations = extract_all_tag_text(&entry_block, "arxiv:affiliation");
+        if affiliations.is_empty() {
+            affiliations = extract_all_tag_text(&entry_block, "affiliation");
+        }
+        if affiliations.is_empty() {
+            continue;
+        }
+        let mut unique = Vec::new();
+        for affiliation in affiliations {
+            let cleaned = decode_xml_entities(&affiliation);
+            if cleaned.is_empty() {
+                continue;
+            }
+            if !unique.contains(&cleaned) {
+                unique.push(cleaned);
+            }
+        }
+        if !unique.is_empty() {
+            map.insert(id, unique);
+        }
+    }
+    map
+}
+
+fn next_xml_block(xml: &str, tag: &str, start: usize) -> Option<(String, usize)> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let start = xml.get(start..)?.find(&open)? + start;
+    let start_tag_end = xml.get(start..)?.find('>')? + start;
+    let end = xml.get(start_tag_end..)?.find(&close)? + start_tag_end;
+    let body_start = start_tag_end + 1;
+    let body = xml.get(body_start..end)?.to_string();
+    Some((body, end + close.len()))
+}
+
+fn extract_first_tag_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block.get(start..)?.find(&close)? + start;
+    let text = block.get(start..end)?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn extract_all_tag_text(block: &str, tag: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut cursor = 0;
+    while let Some(start_rel) = block.get(cursor..).and_then(|s| s.find(&open)) {
+        let start = cursor + start_rel;
+        let tag_end = block.get(start..).and_then(|s| s.find('>')).map(|v| v + start);
+        let Some(content_start) = tag_end.map(|v| v + 1) else {
+            break;
+        };
+        let Some(end_rel) = block.get(content_start..).and_then(|s| s.find(&close)) else {
+            break;
+        };
+        let end = content_start + end_rel;
+        if let Some(text) = block.get(content_start..end) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                results.push(trimmed.to_string());
+            }
+        }
+        cursor = end + close.len();
+    }
+    results
+}
+
+fn decode_xml_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 fn openai_responses_text(
@@ -687,6 +795,8 @@ Return JSON only: {{\"results\":[{{\"title\":\"...\",\"url\":\"...\",\"snippet\"
             published: Some(published_date.to_string()),
             abstract_text,
             summary: None,
+            authors: Vec::new(),
+            affiliations: Vec::new(),
         });
     }
     if items.is_empty() {
@@ -789,6 +899,18 @@ fn write_report(
                     writeln!(file, "- [{}]({})", item.title, item.url)?;
                 }
             }
+            let authors_line = if item.authors.is_empty() {
+                "Authors: n/a".to_string()
+            } else {
+                format!("Authors: {}", item.authors.join(", "))
+            };
+            let affiliations_line = if item.affiliations.is_empty() {
+                "Affiliations: not provided".to_string()
+            } else {
+                format!("Affiliations: {}", item.affiliations.join("; "))
+            };
+            writeln!(file, "  - {}", authors_line)?;
+            writeln!(file, "  - {}", affiliations_line)?;
             if let Some(summary) = &item.summary {
                 for line in summary.lines() {
                     let trimmed = line.trim();
