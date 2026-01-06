@@ -109,8 +109,9 @@ This repo also includes a Slack bot that answers `/ask` and `/ask_paper` via Soc
 
 1) Create a Slack app, enable **Socket Mode**, and generate an app-level token with the `connections:write` scope.
 2) Add a bot user and install the app to your workspace.
-3) Add four slash commands: `/ask`, `/ask_paper`, `/papers`, and `/sync`. The request URL is unused in Socket Mode.
-4) Ensure the app has the `commands` scope.
+3) Enable **Interactivity** and set a placeholder Request URL (Socket Mode delivers the events).
+4) Add four slash commands: `/ask`, `/ask_paper`, `/papers`, and `/sync`. The request URL is unused in Socket Mode.
+5) Ensure the app has `commands`, `chat:write`, and `views:write` scopes.
 
 ### Run
 
@@ -121,7 +122,7 @@ cargo run --bin slack_bot
 ### Commands
 
 - `/ask <question>` answers using top-K retrieved chunks.
-- `/ask_paper <paper> | <question>` answers from the full paper via map-reduce. `paper` can be a filename, substring of the source path (for example `2512.04226v1.pdf`), or a report title (for example `tritonBLAS`).
+- `/ask_paper` opens a modal with paper autocomplete and a question field, then answers from the full paper via map-reduce.
 - `/papers [filter]` lists available papers in the RAG index. Provide an optional filter to narrow by title or filename.
 - `/sync` triggers the user-level RAG sync service to pull the latest artifacts and restart the bot.
 Slack replies use plain text labels (`Paper`, `Question`, `Answer`, `Context`) for reliable formatting.

@@ -218,6 +218,18 @@ impl TitleIndex {
     }
 }
 
+struct PaperEntry {
+    source: String,
+    title: Option<String>,
+    label: String,
+    value: String,
+}
+
+struct PaperIndex {
+    entries: Vec<PaperEntry>,
+    value_to_source: HashMap<String, String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PaperSummaryCache {
     source: String,
@@ -234,6 +246,7 @@ struct SlackState {
     http_client: HttpClient,
     rag_index: EmbeddingsIndex,
     title_index: TitleIndex,
+    paper_index: PaperIndex,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +271,7 @@ struct SlackSlashPayload {
     response_url: String,
     user_id: Option<String>,
     channel_id: Option<String>,
+    trigger_id: Option<String>,
 }
 
 #[tokio::main]
@@ -272,6 +286,7 @@ async fn main() -> Result<()> {
             TitleIndex::empty()
         }
     };
+    let paper_index = build_paper_index(&rag_index, &title_index);
     let http_client = HttpClient::builder()
         .user_agent("research-bot-slack/0.1")
         .build()
@@ -281,6 +296,7 @@ async fn main() -> Result<()> {
         http_client,
         rag_index,
         title_index,
+        paper_index,
     });
 
     loop {
@@ -314,7 +330,18 @@ async fn run_socket_loop(state: Arc<SlackState>) -> Result<()> {
                 continue;
             }
         };
-        let ack = json!({ "envelope_id": envelope.envelope_id }).to_string();
+        let mut ack_payload = None;
+        if envelope.envelope_type == "interactive" {
+            match handle_interactive_payload(state.clone(), &envelope.payload).await {
+                Ok(payload) => ack_payload = payload,
+                Err(err) => eprintln!("Slack interactive error: {err}"),
+            }
+        }
+        let ack = if let Some(payload) = ack_payload {
+            json!({ "envelope_id": envelope.envelope_id, "payload": payload }).to_string()
+        } else {
+            json!({ "envelope_id": envelope.envelope_id }).to_string()
+        };
         ws_write
             .send(Message::Text(ack))
             .await
@@ -405,15 +432,36 @@ async fn handle_slash_command(state: Arc<SlackState>, payload: SlackSlashPayload
             .await?;
         }
         "/ask_paper" => {
-            let (paper, question) = parse_paper_question(text)?;
-            let response = answer_ask_paper(&state, &paper, &question).await?;
-            post_slack_response(
-                &state.http_client,
-                &payload.response_url,
-                &response,
-                &state.config.slack_response_type,
+            let trigger_id = match payload.trigger_id.as_deref() {
+                Some(value) if !value.trim().is_empty() => value,
+                _ => {
+                    return post_slack_response(
+                        &state.http_client,
+                        &payload.response_url,
+                        "Missing trigger_id for modal. Please try again.",
+                        &state.config.slack_response_type,
+                    )
+                    .await;
+                }
+            };
+            if let Err(err) = open_ask_paper_modal(
+                &state,
+                trigger_id,
+                payload.channel_id.as_deref(),
+                payload.user_id.as_deref(),
+                if text.is_empty() { None } else { Some(text) },
             )
-            .await?;
+            .await
+            {
+                let message = format!("Failed to open modal: {err}");
+                post_slack_response(
+                    &state.http_client,
+                    &payload.response_url,
+                    &message,
+                    &state.config.slack_response_type,
+                )
+                .await?;
+            }
         }
         _ => {
             let message = format!("Unknown command: {}", payload.command);
@@ -470,73 +518,39 @@ fn trim_output(bytes: &[u8]) -> String {
 }
 
 fn list_available_papers(state: &SlackState, query: &str) -> String {
-    let mut sources = BTreeSet::new();
-    for chunk in &state.rag_index.chunks {
-        if let Some(source) = chunk.source.as_deref() {
-            if is_paper_source(source) {
-                sources.insert(source.to_string());
-            }
-        }
+    let query = query.trim();
+    let mut entries: Vec<&PaperEntry> = state.paper_index.entries.iter().collect();
+    if !query.is_empty() {
+        entries.retain(|entry| paper_matches_query(entry, query));
     }
 
-    let mut entries: Vec<(String, Option<String>)> = sources
-        .into_iter()
-        .map(|source| {
-            let title = title_for_source(&state.title_index, &source);
-            (source, title)
-        })
-        .collect();
-
-    if !query.trim().is_empty() {
-        let query_lower = query.trim().to_lowercase();
-        let query_norm = normalize_title(query.trim());
-        entries.retain(|(source, title)| {
-            if source.to_lowercase().contains(&query_lower) {
-                return true;
-            }
-            if query_norm.is_empty() {
-                return false;
-            }
-            if let Some(title) = title {
-                let title_norm = normalize_title(title);
-                return title_norm.contains(&query_norm) || query_norm.contains(&title_norm);
-            }
-            false
-        });
-    }
-
-    entries.sort_by(|a, b| match (&a.1, &b.1) {
-        (Some(title_a), Some(title_b)) => title_a.cmp(title_b).then(a.0.cmp(&b.0)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.0.cmp(&b.0),
-    });
+    entries.sort_by(|a, b| a.label.cmp(&b.label).then(a.source.cmp(&b.source)));
 
     let total = entries.len();
     if total == 0 {
-        if query.trim().is_empty() {
+        if query.is_empty() {
             return "No papers found in the RAG index.".to_string();
         }
-        return format!("No papers matched \"{}\".", query.trim());
+        return format!("No papers matched \"{}\".", query);
     }
 
     let max_items = 30usize;
     let shown = std::cmp::min(total, max_items);
     let mut lines = Vec::with_capacity(shown);
-    for (source, title) in entries.into_iter().take(shown) {
-        if let Some(title) = title {
-            lines.push(format!("- {} ({})", title, source));
+    for entry in entries.into_iter().take(shown) {
+        if let Some(title) = &entry.title {
+            lines.push(format!("- {} ({})", title, entry.source));
         } else {
-            lines.push(format!("- {}", source));
+            lines.push(format!("- {}", entry.source));
         }
     }
 
-    let mut header = if query.trim().is_empty() {
+    let mut header = if query.is_empty() {
         format!("Available papers (total: {total}). Showing {shown}:")
     } else {
         format!(
             "Matched papers for \"{}\" (total: {total}). Showing {shown}:",
-            query.trim()
+            query
         )
     };
     if shown < total {
@@ -551,17 +565,142 @@ fn is_paper_source(source: &str) -> bool {
     source.starts_with("papers/") && source.to_ascii_lowercase().ends_with(".pdf")
 }
 
-fn parse_paper_question(text: &str) -> Result<(String, String)> {
-    let parts: Vec<&str> = text.splitn(2, '|').collect();
-    if parts.len() != 2 {
-        bail!("Usage: /ask_paper <paper> | <question>");
+async fn handle_interactive_payload(
+    state: Arc<SlackState>,
+    payload: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    let payload_type = payload
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    match payload_type {
+        "block_suggestion" => Ok(Some(handle_block_suggestion(state, payload))),
+        "view_submission" => handle_view_submission(state, payload).await,
+        _ => Ok(None),
     }
-    let paper = parts[0].trim();
-    let question = parts[1].trim();
-    if paper.is_empty() || question.is_empty() {
-        bail!("Usage: /ask_paper <paper> | <question>");
+}
+
+fn handle_block_suggestion(state: Arc<SlackState>, payload: &serde_json::Value) -> serde_json::Value {
+    let action_id = payload
+        .get("action_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            payload
+                .get("actions")
+                .and_then(|value| value.as_array())
+                .and_then(|actions| actions.first())
+                .and_then(|action| action.get("action_id"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or("");
+    if action_id != "paper_select" {
+        return json!({ "options": [] });
     }
-    Ok((paper.to_string(), question.to_string()))
+    let query = payload
+        .get("value")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let options = paper_options_for_query(&state.paper_index, query);
+    json!({ "options": options })
+}
+
+async fn handle_view_submission(
+    state: Arc<SlackState>,
+    payload: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    let view = match payload.get("view") {
+        Some(view) => view,
+        None => return Ok(None),
+    };
+    let values = view
+        .get("state")
+        .and_then(|state| state.get("values"))
+        .and_then(|values| values.as_object())
+        .ok_or_else(|| anyhow::anyhow!("missing modal state values"))?;
+    let paper_value = values
+        .get("paper_block")
+        .and_then(|block| block.get("paper_select"))
+        .and_then(|value| value.get("selected_option"))
+        .and_then(|value| value.get("value"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let question = values
+        .get("question_block")
+        .and_then(|block| block.get("question_input"))
+        .and_then(|value| value.get("value"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string());
+
+    if paper_value.is_none() {
+        return Ok(Some(json!({
+            "response_action": "errors",
+            "errors": { "paper_block": "Select a paper." }
+        })));
+    }
+    if question.as_deref().unwrap_or("").is_empty() {
+        return Ok(Some(json!({
+            "response_action": "errors",
+            "errors": { "question_block": "Enter a question." }
+        })));
+    }
+
+    let metadata = view
+        .get("private_metadata")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let metadata: ModalMetadata = serde_json::from_str(metadata)
+        .context("parse modal private_metadata")?;
+
+    let paper_value = paper_value.expect("paper value checked");
+    let question = question.expect("question checked");
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            handle_modal_submission(state_clone, metadata, paper_value, question).await
+        {
+            eprintln!("Modal submission error: {err}");
+        }
+    });
+
+    Ok(None)
+}
+
+#[derive(Deserialize)]
+struct ModalMetadata {
+    channel_id: Option<String>,
+    user_id: Option<String>,
+    response_type: Option<String>,
+}
+
+async fn handle_modal_submission(
+    state: Arc<SlackState>,
+    metadata: ModalMetadata,
+    paper_value: String,
+    question: String,
+) -> Result<()> {
+    let channel_id = metadata
+        .channel_id
+        .ok_or_else(|| anyhow::anyhow!("modal missing channel_id"))?;
+    let response_type = metadata
+        .response_type
+        .unwrap_or_else(|| state.config.slack_response_type.clone());
+    let user_id = metadata.user_id;
+    let source = state
+        .paper_index
+        .value_to_source
+        .get(&paper_value)
+        .ok_or_else(|| anyhow::anyhow!("unknown paper selection"))?
+        .to_string();
+    let answer = answer_ask_paper_by_source(&state, &source, &question).await?;
+    post_slack_chat(
+        &state.http_client,
+        &state.config.slack_bot_token,
+        &channel_id,
+        user_id.as_deref(),
+        &response_type,
+        &answer,
+    )
+    .await
 }
 
 async fn post_slack_response(
@@ -585,6 +724,138 @@ async fn post_slack_response(
     if !status.is_success() {
         bail!("slack response error: {} {}", status, body);
     }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SlackApiResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
+async fn slack_api_post(
+    client: &HttpClient,
+    token: &str,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let url = format!("https://slack.com/api/{endpoint}");
+    let response = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .context("send slack api request")?;
+    let status = response.status();
+    let payload = response.text().await.context("read slack api response")?;
+    if !status.is_success() {
+        bail!("slack api error: {} {}", status, payload);
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).context("parse slack api response")?;
+    let ok = serde_json::from_value::<SlackApiResponse>(parsed.clone())
+        .context("parse slack api ok response")?;
+    if !ok.ok {
+        bail!(
+            "slack api error: {}",
+            ok.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(parsed)
+}
+
+async fn post_slack_chat(
+    client: &HttpClient,
+    token: &str,
+    channel_id: &str,
+    user_id: Option<&str>,
+    response_type: &str,
+    text: &str,
+) -> Result<()> {
+    let response_type = response_type.trim();
+    let is_direct_message = channel_id.starts_with('D');
+    if response_type == "in_channel" || is_direct_message {
+        let body = json!({ "channel": channel_id, "text": text });
+        slack_api_post(client, token, "chat.postMessage", body).await?;
+        return Ok(());
+    }
+    let user_id = user_id.ok_or_else(|| anyhow::anyhow!("missing user_id for ephemeral reply"))?;
+    let body = json!({ "channel": channel_id, "user": user_id, "text": text });
+    slack_api_post(client, token, "chat.postEphemeral", body).await?;
+    Ok(())
+}
+
+async fn open_ask_paper_modal(
+    state: &SlackState,
+    trigger_id: &str,
+    channel_id: Option<&str>,
+    user_id: Option<&str>,
+    initial_question: Option<&str>,
+) -> Result<()> {
+    let metadata = json!({
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "response_type": state.config.slack_response_type,
+    })
+    .to_string();
+    let question_input = json!({
+        "type": "plain_text_input",
+        "action_id": "question_input",
+        "multiline": true,
+    });
+    let question_input = if let Some(initial) = initial_question {
+        let initial = initial.trim();
+        if initial.is_empty() {
+            question_input
+        } else {
+            let mut value = question_input;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("initial_value".to_string(), json!(truncate_text(initial, 1500)));
+            }
+            value
+        }
+    } else {
+        question_input
+    };
+    let view = json!({
+        "type": "modal",
+        "callback_id": "ask_paper_modal",
+        "title": { "type": "plain_text", "text": "Ask paper" },
+        "submit": { "type": "plain_text", "text": "Ask" },
+        "close": { "type": "plain_text", "text": "Cancel" },
+        "private_metadata": metadata,
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "paper_block",
+                "label": { "type": "plain_text", "text": "Paper" },
+                "element": {
+                    "type": "external_select",
+                    "action_id": "paper_select",
+                    "placeholder": { "type": "plain_text", "text": "Search papers..." },
+                    "min_query_length": 1
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "question_block",
+                "label": { "type": "plain_text", "text": "Question" },
+                "element": question_input
+            }
+        ]
+    });
+    let body = json!({
+        "trigger_id": trigger_id,
+        "view": view
+    });
+    slack_api_post(
+        &state.http_client,
+        &state.config.slack_bot_token,
+        "views.open",
+        body,
+    )
+    .await?;
     Ok(())
 }
 
@@ -714,23 +985,49 @@ Run download/ingest to add papers.\nTitles:\n- ",
             .filter(|chunk| chunk.source.as_deref() == Some(source.as_str()))
             .collect();
     }
+    build_paper_answer(state, &source, chunks, question).await
+}
+
+async fn answer_ask_paper_by_source(
+    state: &SlackState,
+    source: &str,
+    question: &str,
+) -> Result<String> {
+    let chunks: Vec<&RagChunk> = state
+        .rag_index
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.source.as_deref() == Some(source))
+        .collect();
+    if chunks.is_empty() {
+        bail!("no chunks found for selected paper");
+    }
+    build_paper_answer(state, source, chunks, question).await
+}
+
+async fn build_paper_answer(
+    state: &SlackState,
+    source: &str,
+    mut chunks: Vec<&RagChunk>,
+    question: &str,
+) -> Result<String> {
     chunks.sort_by_key(|chunk| chunk.chunk_index.unwrap_or(usize::MAX));
     let sections = build_paper_sections(&chunks, state.config.rag_paper_map_max_chars)?;
     let content_hash = paper_content_hash(&chunks);
-    let cached_summary = load_paper_summary_cache(&state.config, &source, &content_hash)?;
+    let cached_summary = load_paper_summary_cache(&state.config, source, &content_hash)?;
     let summary = if let Some(summary) = cached_summary {
         summary
     } else {
         let section_summaries =
-            summarize_paper_sections(&state.http_client, &state.config, &source, &sections).await?;
+            summarize_paper_sections(&state.http_client, &state.config, source, &sections).await?;
         let summary = reduce_paper_summary(
             &state.http_client,
             &state.config,
-            &source,
+            source,
             &section_summaries,
         )
         .await?;
-        if let Err(err) = write_paper_summary_cache(&state.config, &source, &content_hash, &summary)
+        if let Err(err) = write_paper_summary_cache(&state.config, source, &content_hash, &summary)
         {
             eprintln!("Failed to write paper summary cache: {err}");
         }
@@ -745,10 +1042,10 @@ Paper summary:\n{summary}\n\nQuestion: {question}\nAnswer:",
         question = question
     );
     let answer = openai_response_text(&state.http_client, &state.config, &prompt).await?;
-    let title = title_for_source(&state.title_index, &source);
+    let title = title_for_source(&state.title_index, source);
     let context_note =
-        build_paper_context_note(&source, title.as_deref(), chunks.len(), sections.len());
-    let question_label = paper_label_for_question(title.as_deref(), &source);
+        build_paper_context_note(source, title.as_deref(), chunks.len(), sections.len());
+    let question_label = paper_label_for_question(title.as_deref(), source);
     Ok(format_reply(
         question,
         question_label.as_deref(),
@@ -1131,6 +1428,13 @@ fn paper_content_hash(chunks: &[&RagChunk]) -> String {
     format!("{hash:016x}")
 }
 
+fn hash_string(bytes: &[u8]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let hash = fnv1a_update(FNV_OFFSET, bytes, FNV_PRIME);
+    format!("{hash:016x}")
+}
+
 fn fnv1a_update(mut hash: u64, bytes: &[u8], prime: u64) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -1363,6 +1667,92 @@ fn load_title_index(config: &Config, rag_index: &EmbeddingsIndex) -> Result<Titl
     Ok(TitleIndex { entries })
 }
 
+fn build_paper_index(rag_index: &EmbeddingsIndex, title_index: &TitleIndex) -> PaperIndex {
+    let mut sources = BTreeSet::new();
+    for chunk in &rag_index.chunks {
+        if let Some(source) = chunk.source.as_deref() {
+            if is_paper_source(source) {
+                sources.insert(source.to_string());
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut value_to_source = HashMap::new();
+    for source in sources {
+        let title = title_for_source(title_index, &source);
+        let label = paper_label(&source, title.as_deref());
+        let value = paper_value_for_source(&source);
+        value_to_source.insert(value.clone(), source.clone());
+        entries.push(PaperEntry {
+            source,
+            title,
+            label,
+            value,
+        });
+    }
+    PaperIndex {
+        entries,
+        value_to_source,
+    }
+}
+
+fn paper_label(source: &str, title: Option<&str>) -> String {
+    if let Some(title) = title {
+        let name = Path::new(source)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(source);
+        let label = format!("{title} ({name})");
+        return truncate_option_text(&label, 75);
+    }
+    let name = Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(source);
+    truncate_option_text(name, 75)
+}
+
+fn paper_value_for_source(source: &str) -> String {
+    let hash = hash_string(source.as_bytes());
+    format!("paper:{hash}")
+}
+
+fn paper_options_for_query(index: &PaperIndex, query: &str) -> Vec<serde_json::Value> {
+    let query = query.trim();
+    let mut entries: Vec<&PaperEntry> = index.entries.iter().collect();
+    if !query.is_empty() {
+        entries.retain(|entry| paper_matches_query(entry, query));
+    }
+    entries.sort_by(|a, b| a.label.cmp(&b.label).then(a.source.cmp(&b.source)));
+    entries
+        .into_iter()
+        .take(50)
+        .map(|entry| {
+            json!({
+                "text": { "type": "plain_text", "text": entry.label },
+                "value": entry.value.clone(),
+            })
+        })
+        .collect()
+}
+
+fn paper_matches_query(entry: &PaperEntry, query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+    if entry.source.to_lowercase().contains(&query_lower) {
+        return true;
+    }
+    let query_norm = normalize_title(query);
+    if query_norm.is_empty() {
+        return false;
+    }
+    if let Some(title) = &entry.title {
+        let title_norm = normalize_title(title);
+        return title_norm.contains(&query_norm) || query_norm.contains(&title_norm);
+    }
+    false
+}
+
 fn format_reply(
     question: &str,
     paper_label: Option<&str>,
@@ -1370,14 +1760,14 @@ fn format_reply(
     context_note: &str,
     max: usize,
 ) -> String {
-    let question = truncate_text(question.trim(), 400);
+    let question = truncate_text(&normalize_slack_text(question.trim()), 400);
     let paper = paper_label
         .and_then(|label| {
             let trimmed = label.trim();
             if trimmed.is_empty() {
                 None
             } else {
-                Some(truncated_label(trimmed))
+                Some(truncated_label(&normalize_slack_text(trimmed)))
             }
         })
         .unwrap_or_else(|| "n/a".to_string());
@@ -1388,14 +1778,14 @@ fn format_reply(
     if context.is_empty() {
         context = "none";
     }
-    let context = truncate_text(context, 600);
+    let context = truncate_text(&normalize_slack_text(context), 600);
 
     let question = if question.is_empty() {
         "n/a".to_string()
     } else {
         question
     };
-    let answer = answer.trim();
+    let answer = normalize_slack_text(answer.trim());
     let header = format!("Paper: {paper}\nQuestion: {question}\nAnswer:\n");
     let footer = format!("\nContext: {context}");
     if header.len() + footer.len() >= max {
@@ -1405,12 +1795,26 @@ fn format_reply(
         return truncate_text(&combined, max);
     }
     let max_answer = max.saturating_sub(header.len() + footer.len());
-    let answer = truncate_text(answer, max_answer);
+    let answer = truncate_text(&answer, max_answer);
     format!("{header}{answer}{footer}")
 }
 
 fn truncated_label(label: &str) -> String {
     truncate_text(label, 200)
+}
+
+fn truncate_option_text(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    if max <= 3 {
+        return "...".to_string();
+    }
+    truncate_text(text, max - 3)
+}
+
+fn normalize_slack_text(text: &str) -> String {
+    text.replace("**", "*")
 }
 
 fn truncate_text(text: &str, max: usize) -> String {
