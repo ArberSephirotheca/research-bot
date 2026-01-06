@@ -6,3 +6,4 @@ rag/chunks.jsonl
 rag/embeddings.jsonl
 rag/paper_summaries/
 papers/**/*.pdf
+/artifacts
