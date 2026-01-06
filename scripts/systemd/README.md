@@ -20,6 +20,11 @@ GH_TOKEN=your-gh-token
 ```
 
 `GH_TOKEN` (or `GITHUB_TOKEN`) must have `actions:read` and `repo` access for private repos.
+For the Slack `/sync` command (option A), add a sudoers rule so the bot can start the sync service:
+
+```
+zheyuanchen ALL=NOPASSWD: /bin/systemctl start research-bot-rag-sync.service
+```
 
 ## Install
 

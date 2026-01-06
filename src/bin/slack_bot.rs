@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
@@ -39,6 +40,8 @@ struct Config {
     rag_paper_summary_cache_dir: String,
     rag_paper_summary_cache_ttl_secs: u64,
     ask_max_response_chars: usize,
+    rag_sync_service: String,
+    rag_sync_use_sudo: bool,
 }
 
 impl Config {
@@ -67,6 +70,11 @@ impl Config {
                 7 * 24 * 60 * 60,
             ) as u64,
             ask_max_response_chars: parse_env_usize("ASK_MAX_RESPONSE_CHARS", 1800),
+            rag_sync_service: parse_env_string(
+                "RAG_SYNC_SERVICE",
+                "research-bot-rag-sync.service",
+            ),
+            rag_sync_use_sudo: parse_env_bool("RAG_SYNC_USE_SUDO", true),
         })
     }
 }
@@ -84,6 +92,16 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,6 +384,16 @@ async fn handle_slash_command(state: Arc<SlackState>, payload: SlackSlashPayload
             )
             .await?;
         }
+        "/sync" => {
+            let response = trigger_rag_sync(&state).await;
+            post_slack_response(
+                &state.http_client,
+                &payload.response_url,
+                &response,
+                &state.config.slack_response_type,
+            )
+            .await?;
+        }
         "/papers" => {
             let response = list_available_papers(&state, text);
             post_slack_response(
@@ -399,6 +427,44 @@ async fn handle_slash_command(state: Arc<SlackState>, payload: SlackSlashPayload
         }
     }
     Ok(())
+}
+
+async fn trigger_rag_sync(state: &SlackState) -> String {
+    let service = state.config.rag_sync_service.trim();
+    if service.is_empty() {
+        return "RAG_SYNC_SERVICE is empty; cannot run sync.".to_string();
+    }
+    let mut command = if state.config.rag_sync_use_sudo {
+        let mut command = Command::new("sudo");
+        command.arg("systemctl");
+        command
+    } else {
+        Command::new("systemctl")
+    };
+    command.arg("start").arg(service);
+
+    match command.output().await {
+        Ok(output) if output.status.success() => {
+            format!("Sync triggered: {}", service)
+        }
+        Ok(output) => {
+            let stdout = trim_output(&output.stdout);
+            let stderr = trim_output(&output.stderr);
+            let mut message = format!("Sync failed ({}).", output.status);
+            if !stderr.is_empty() {
+                message.push_str(&format!(" stderr: {}", stderr));
+            }
+            if !stdout.is_empty() {
+                message.push_str(&format!(" stdout: {}", stdout));
+            }
+            message
+        }
+        Err(err) => format!("Sync failed: {}", err),
+    }
+}
+
+fn trim_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
 }
 
 fn list_available_papers(state: &SlackState, query: &str) -> String {
