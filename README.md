@@ -101,6 +101,57 @@ ASK_MAX_RESPONSE_CHARS=1800
 
 You can place these in `.env` for local runs.
 
+## Slack RAG bot (Socket Mode)
+
+This repo also includes a Slack bot that answers `/ask` and `/ask_paper` via Socket Mode (no public HTTPS endpoint required).
+
+### Setup
+
+1) Create a Slack app, enable **Socket Mode**, and generate an app-level token with the `connections:write` scope.
+2) Add a bot user and install the app to your workspace.
+3) Add two slash commands: `/ask` and `/ask_paper`. The request URL is unused in Socket Mode.
+4) Ensure the app has the `commands` scope.
+
+### Run
+
+```bash
+cargo run --bin slack_bot
+```
+
+### Commands
+
+- `/ask <question>` answers using top-K retrieved chunks.
+- `/ask_paper <paper> | <question>` answers from the full paper via map-reduce. `paper` can be a filename, substring of the source path (for example `2512.04226v1.pdf`), or a report title (for example `tritonBLAS`).
+
+### Required env
+
+```
+SLACK_APP_TOKEN=your-xapp-token
+SLACK_BOT_TOKEN=your-xoxb-token
+OPENAI_API_KEY=your-openai-key
+```
+
+Optional:
+
+```
+SLACK_RESPONSE_TYPE=ephemeral
+OPENAI_CHAT_MODEL=gpt-5.2
+OPENAI_EMBED_MODEL=text-embedding-3-small
+OPENAI_BASE_URL=https://api.openai.com/v1
+RAG_EMBEDDINGS_PATH=rag/embeddings.jsonl
+REPORTS_DIR=reports
+RAG_TOP_K=12
+RAG_MAX_CONTEXT_CHARS=8000
+RAG_PAPER_MAP_MAX_CHARS=6000
+RAG_PAPER_REDUCE_MAX_CHARS=12000
+RAG_PAPER_MAP_CONCURRENCY=3
+RAG_PAPER_SUMMARY_CACHE_DIR=rag/paper_summaries
+RAG_PAPER_SUMMARY_CACHE_TTL_SECS=604800
+ASK_MAX_RESPONSE_CHARS=1800
+```
+
+You can place these in `.env` for local runs.
+
 ## Secrets setup
 
 GitHub Actions reads `OPENAI_API_KEY` from secrets. Prefer the environment secret so you can gate runs:
@@ -123,6 +174,26 @@ The workflow is at `.github/workflows/daily.yml`.
 If `--summarize` or `--discover` is enabled in the workflow, add `OPENAI_API_KEY` in repo or environment settings.
 The workflow uses the `openai` environment so you can require approvals and keep the key scoped.
 Use a dedicated OpenAI key with strict spend limits to reduce blast radius.
+
+## RAG artifacts workflow (server sync)
+
+The bot reads local files from `papers/` and `rag/`, so it cannot use GitHub storage directly. To keep the repo clean, use the artifacts workflow instead of committing PDFs/embeddings.
+
+`rag_artifacts.yml` runs daily (and on manual dispatch) and uploads an artifact named `rag-artifacts` containing:
+
+- `papers/` (downloaded PDFs)
+- `rag/chunks.jsonl`
+- `rag/embeddings.jsonl`
+
+Server sync example (requires `gh` CLI + a token with `actions:read` and `repo` scope for private repos):
+
+```bash
+gh run list -w "Build RAG Artifacts" -L 1 --json databaseId -q '.[0].databaseId'
+gh run download <run-id> -n rag-artifacts -D /tmp/rag-artifacts
+rsync -a /tmp/rag-artifacts/ /path/to/research-bot/
+```
+
+Run the sync before starting the Slack/Discord bot, and keep the repo updated with `git pull` for the latest reports.
 
 ## Layout
 

@@ -1,0 +1,54 @@
+name: Build RAG Artifacts
+
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rag:
+    runs-on: ubuntu-latest
+    environment: openai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install pypdf requests
+
+      - name: Guard OpenAI key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "${OPENAI_API_KEY}" ]]; then
+            echo "OPENAI_API_KEY is not set. Add it as a repo or environment secret."
+            exit 1
+          fi
+          echo "::add-mask::$OPENAI_API_KEY"
+
+      - name: Download papers
+        run: python scripts/download_papers.py --reports-dir reports --out-dir papers
+
+      - name: Build RAG embeddings
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_EMBED_MODEL: ${{ vars.OPENAI_EMBED_MODEL }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+        run: python scripts/rag_ingest.py --input-dir papers --reports-dir reports
+
+      - name: Upload RAG artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-artifacts
+          path: |
+            papers/
+            rag/chunks.jsonl
+            rag/embeddings.jsonl

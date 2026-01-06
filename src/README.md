@@ -1,6 +1,6 @@
 # src/
 
-Rust CLI that fetches GPU-related feeds, generates a daily digest, and updates the visited database. The entry point is `src/main.rs`. A Discord RAG bot lives at `src/bin/discord_bot.rs`.
+Rust CLI that fetches GPU-related feeds, generates a daily digest, and updates the visited database. The entry point is `src/main.rs`. A Discord RAG bot lives at `src/bin/discord_bot.rs`. A Slack Socket Mode bot lives at `src/bin/slack_bot.rs`.
 
 ## Key pieces
 
@@ -14,3 +14,4 @@ Rust CLI that fetches GPU-related feeds, generates a daily digest, and updates t
 - `/ask_paper` caches per-paper summaries under `RAG_PAPER_SUMMARY_CACHE_DIR` for faster repeat queries.
 - `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` controls cache expiry (0 disables expiry).
 - `/ask_paper` paper option supports Discord autocomplete suggestions from titles and sources.
+- Slack bot runs in Socket Mode and responds to `/ask` and `/ask_paper` slash commands.
