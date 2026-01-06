@@ -1,15 +1,10 @@
-[Unit]
-Description=Research Bot Slack (Socket Mode)
-After=network-online.target
-Wants=network-online.target
-
 [Service]
 Type=simple
-WorkingDirectory=/opt/research-bot
-EnvironmentFile=/etc/research-bot/research-bot.env
-ExecStart=/usr/bin/cargo run --bin slack_bot
+WorkingDirectory=%h/research-bot
+EnvironmentFile=%h/research-bot/.env
+ExecStart=%h/.cargo/bin/cargo run --bin slack_bot
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

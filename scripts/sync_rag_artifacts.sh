@@ -35,6 +35,11 @@ fi
 
 WORKFLOW_NAME="Build RAG Artifacts"
 ARTIFACT_NAME="rag-artifacts"
+SYSTEMCTL_ARGS=()
+
+if [[ "${RAG_SYNC_SYSTEMCTL_USER:-}" =~ ^(1|true|yes|on)$ ]]; then
+  SYSTEMCTL_ARGS+=(--user)
+fi
 
 cd "$REPO_DIR"
 git pull --ff-only
@@ -68,4 +73,4 @@ rsync -a --delete "$RAG_SYNC_TMP_DIR/papers/" "$REPO_DIR/papers/"
 cp "$RAG_SYNC_TMP_DIR/rag/chunks.jsonl" "$REPO_DIR/rag/chunks.jsonl"
 cp "$RAG_SYNC_TMP_DIR/rag/embeddings.jsonl" "$REPO_DIR/rag/embeddings.jsonl"
 
-systemctl restart "$RAG_SYNC_SERVICE"
+systemctl "${SYSTEMCTL_ARGS[@]}" restart "$RAG_SYNC_SERVICE"

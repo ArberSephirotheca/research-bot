@@ -1,9 +1,4 @@
-[Unit]
-Description=Sync RAG artifacts for research-bot
-After=network-online.target
-Wants=network-online.target
-
 [Service]
 Type=oneshot
-EnvironmentFile=/etc/research-bot/rag-sync.env
-ExecStart=/opt/research-bot/scripts/sync_rag_artifacts.sh
+EnvironmentFile=%h/research-bot/rag-sync.env
+ExecStart=%h/research-bot/scripts/sync_rag_artifacts.sh

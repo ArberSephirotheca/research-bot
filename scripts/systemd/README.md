@@ -1,42 +1,45 @@
 # scripts/systemd/
 
-Systemd unit files for running the Slack bot and syncing RAG artifacts daily.
+User-level systemd unit files for running the Slack bot and syncing RAG artifacts daily.
 
 ## Files
 
-- `research-bot-slack.service`: example service for `cargo run --bin slack_bot`.
-- `research-bot-rag-sync.service`: oneshot service that runs `scripts/sync_rag_artifacts.sh`.
-- `research-bot-rag-sync.timer`: daily timer that triggers the sync service.
+- `research-bot-slack.service`: user service for `cargo run --bin slack_bot`.
+- `research-bot-rag-sync.service`: user oneshot service that runs `scripts/sync_rag_artifacts.sh`.
+- `research-bot-rag-sync.timer`: user timer that triggers the sync service.
 
 ## Environment file
 
-Create `/etc/research-bot/rag-sync.env` with:
+Create `~/research-bot/rag-sync.env` with:
 
 ```
-REPO_DIR=/opt/research-bot
-RAG_SYNC_TMP_DIR=/var/lib/research-bot/rag-artifacts
+REPO_DIR=/home/your-user/research-bot
+RAG_SYNC_TMP_DIR=/home/your-user/.cache/research-bot/rag-artifacts
 RAG_SYNC_SERVICE=research-bot-slack.service
+RAG_SYNC_SYSTEMCTL_USER=true
 GH_TOKEN=your-gh-token
 ```
 
 `GH_TOKEN` (or `GITHUB_TOKEN`) must have `actions:read` and `repo` access for private repos.
-For the Slack `/sync` command (option A), add a sudoers rule so the bot can start the sync service:
-
-```
-zheyuanchen ALL=NOPASSWD: /bin/systemctl start research-bot-rag-sync.service
-```
+Set `RAG_SYNC_USE_SUDO=false` in `~/.env` so the Slack `/sync` command uses `systemctl --user`.
 
 ## Install
 
 ```
-sudo install -d /etc/research-bot
-sudo install -m 0644 scripts/systemd/research-bot-slack.service /etc/systemd/system/
-sudo install -m 0644 scripts/systemd/research-bot-rag-sync.service /etc/systemd/system/
-sudo install -m 0644 scripts/systemd/research-bot-rag-sync.timer /etc/systemd/system/
-sudo install -m 0755 scripts/sync_rag_artifacts.sh /opt/research-bot/scripts/sync_rag_artifacts.sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now research-bot-slack.service
-sudo systemctl enable --now research-bot-rag-sync.timer
+mkdir -p ~/.config/systemd/user
+install -m 0644 scripts/systemd/research-bot-slack.service ~/.config/systemd/user/
+install -m 0644 scripts/systemd/research-bot-rag-sync.service ~/.config/systemd/user/
+install -m 0644 scripts/systemd/research-bot-rag-sync.timer ~/.config/systemd/user/
+install -m 0755 scripts/sync_rag_artifacts.sh ~/research-bot/scripts/sync_rag_artifacts.sh
+systemctl --user daemon-reload
+systemctl --user enable --now research-bot-slack.service
+systemctl --user enable --now research-bot-rag-sync.timer
+```
+
+If you want the timer to run while logged out, enable linger:
+
+```
+loginctl enable-linger your-user
 ```
 
 Adjust `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths to match your server layout.

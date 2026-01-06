@@ -74,7 +74,7 @@ impl Config {
                 "RAG_SYNC_SERVICE",
                 "research-bot-rag-sync.service",
             ),
-            rag_sync_use_sudo: parse_env_bool("RAG_SYNC_USE_SUDO", true),
+            rag_sync_use_sudo: parse_env_bool("RAG_SYNC_USE_SUDO", false),
         })
     }
 }
@@ -439,7 +439,9 @@ async fn trigger_rag_sync(state: &SlackState) -> String {
         command.arg("systemctl");
         command
     } else {
-        Command::new("systemctl")
+        let mut command = Command::new("systemctl");
+        command.arg("--user");
+        command
     };
     command.arg("start").arg(service);
 
