@@ -1,6 +1,7 @@
 /target
 Agent.md
 .env
+rag-sync.env
 rag/chunks.jsonl
 rag/embeddings.jsonl
 rag/paper_summaries/

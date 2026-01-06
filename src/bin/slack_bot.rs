@@ -366,6 +366,16 @@ async fn handle_slash_command(state: Arc<SlackState>, payload: SlackSlashPayload
             )
             .await?;
         }
+        "/papers" => {
+            let response = list_available_papers(&state, text);
+            post_slack_response(
+                &state.http_client,
+                &payload.response_url,
+                &response,
+                &state.config.slack_response_type,
+            )
+            .await?;
+        }
         "/ask_paper" => {
             let (paper, question) = parse_paper_question(text)?;
             let response = answer_ask_paper(&state, &paper, &question).await?;
@@ -389,6 +399,88 @@ async fn handle_slash_command(state: Arc<SlackState>, payload: SlackSlashPayload
         }
     }
     Ok(())
+}
+
+fn list_available_papers(state: &SlackState, query: &str) -> String {
+    let mut sources = BTreeSet::new();
+    for chunk in &state.rag_index.chunks {
+        if let Some(source) = chunk.source.as_deref() {
+            if is_paper_source(source) {
+                sources.insert(source.to_string());
+            }
+        }
+    }
+
+    let mut entries: Vec<(String, Option<String>)> = sources
+        .into_iter()
+        .map(|source| {
+            let title = title_for_source(&state.title_index, &source);
+            (source, title)
+        })
+        .collect();
+
+    if !query.trim().is_empty() {
+        let query_lower = query.trim().to_lowercase();
+        let query_norm = normalize_title(query.trim());
+        entries.retain(|(source, title)| {
+            if source.to_lowercase().contains(&query_lower) {
+                return true;
+            }
+            if query_norm.is_empty() {
+                return false;
+            }
+            if let Some(title) = title {
+                let title_norm = normalize_title(title);
+                return title_norm.contains(&query_norm) || query_norm.contains(&title_norm);
+            }
+            false
+        });
+    }
+
+    entries.sort_by(|a, b| match (&a.1, &b.1) {
+        (Some(title_a), Some(title_b)) => title_a.cmp(title_b).then(a.0.cmp(&b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(&b.0),
+    });
+
+    let total = entries.len();
+    if total == 0 {
+        if query.trim().is_empty() {
+            return "No papers found in the RAG index.".to_string();
+        }
+        return format!("No papers matched \"{}\".", query.trim());
+    }
+
+    let max_items = 30usize;
+    let shown = std::cmp::min(total, max_items);
+    let mut lines = Vec::with_capacity(shown);
+    for (source, title) in entries.into_iter().take(shown) {
+        if let Some(title) = title {
+            lines.push(format!("- {} ({})", title, source));
+        } else {
+            lines.push(format!("- {}", source));
+        }
+    }
+
+    let mut header = if query.trim().is_empty() {
+        format!("Available papers (total: {total}). Showing {shown}:")
+    } else {
+        format!(
+            "Matched papers for \"{}\" (total: {total}). Showing {shown}:",
+            query.trim()
+        )
+    };
+    if shown < total {
+        header.push_str(" Use /papers <filter> to narrow.");
+    }
+
+    let message = format!("{}\n{}", header, lines.join("\n"));
+    truncate_text(&message, state.config.ask_max_response_chars)
+}
+
+fn is_paper_source(source: &str) -> bool {
+    source.starts_with("papers/") && source.to_ascii_lowercase().ends_with(".pdf")
 }
 
 fn parse_paper_question(text: &str) -> Result<(String, String)> {
@@ -1236,11 +1328,11 @@ fn format_reply(
         question
     };
     let answer = answer.trim();
-    let header = format!("### Paper\n{paper}\n\n### Question\n{question}\n\n### Answer\n");
-    let footer = format!("\n\n### Context\n{context}");
+    let header = format!("Paper: {paper}\nQuestion: {question}\nAnswer:\n");
+    let footer = format!("\nContext: {context}");
     if header.len() + footer.len() >= max {
         let combined = format!(
-            "### Paper\n{paper}\n\n### Question\n{question}\n\n### Answer\n\n### Context\n{context}"
+            "Paper: {paper}\nQuestion: {question}\nAnswer:\n\nContext: {context}"
         );
         return truncate_text(&combined, max);
     }

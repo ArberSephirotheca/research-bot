@@ -14,4 +14,4 @@ Rust CLI that fetches GPU-related feeds, generates a daily digest, and updates t
 - `/ask_paper` caches per-paper summaries under `RAG_PAPER_SUMMARY_CACHE_DIR` for faster repeat queries.
 - `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` controls cache expiry (0 disables expiry).
 - `/ask_paper` paper option supports Discord autocomplete suggestions from titles and sources.
-- Slack bot runs in Socket Mode and responds to `/ask` and `/ask_paper` slash commands.
+- Slack bot runs in Socket Mode and responds to `/ask`, `/ask_paper`, and `/papers` slash commands with plain text labels for Paper/Question/Answer/Context.

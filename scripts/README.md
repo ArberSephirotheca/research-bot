@@ -30,3 +30,9 @@ python scripts/download_papers.py --reports-dir reports --out-dir papers
 ```
 
 Use `--report` to target a specific report file.
+
+## sync_rag_artifacts.sh
+
+Downloads the latest `rag-artifacts` workflow output via `gh` CLI, syncs `papers/` and `rag/` into the repo, and restarts the Slack bot service.
+
+This script is intended to be run via the systemd units under `scripts/systemd/`.
