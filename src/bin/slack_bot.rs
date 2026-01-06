@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     env,
     fs::{self, File},
     io::{BufRead, BufReader},
@@ -233,12 +233,13 @@ struct PaperIndex {
 #[derive(Debug, Serialize, Deserialize)]
 struct PaperSummaryCache {
     source: String,
+    question_hash: String,
     content_hash: String,
     model: String,
     map_max_chars: usize,
     reduce_max_chars: usize,
     created_at: u64,
-    summary: String,
+    answer: String,
 }
 
 struct SlackState {
@@ -873,15 +874,32 @@ async fn answer_ask(state: &SlackState, question: &str) -> Result<String> {
             state.config.ask_max_response_chars,
         ));
     }
-    let context = build_context(&matches, state.config.rag_max_context_chars)?;
-    let prompt = format!(
-        "You are a GPU research assistant. Use only the provided context. \
-If the answer is not in the context, say you don't know.\n\n\
-Context:\n{context}\n\nQuestion: {question}\nAnswer:",
-        context = context,
-        question = question
-    );
-    let answer = openai_response_text(&state.http_client, &state.config, &prompt).await?;
+    let sections = build_sections_from_chunks(&matches, state.config.rag_paper_map_max_chars)?;
+    let notes = extract_question_notes(
+        &state.http_client,
+        &state.config,
+        "retrieved chunks",
+        question,
+        &sections,
+    )
+    .await?;
+    let notes: Vec<String> = notes
+        .into_iter()
+        .filter(|note| !note_is_empty(note))
+        .filter(|note| !note_is_not_mentioned(note))
+        .collect();
+    let answer = if notes.is_empty() {
+        "I don't know based on the retrieved context.".to_string()
+    } else {
+        answer_from_section_notes(
+            &state.http_client,
+            &state.config,
+            "retrieved chunks",
+            question,
+            &notes,
+        )
+        .await?
+    };
     let context_note = build_context_note(&matches);
     Ok(format_reply(
         question,
@@ -890,102 +908,6 @@ Context:\n{context}\n\nQuestion: {question}\nAnswer:",
         &context_note,
         state.config.ask_max_response_chars,
     ))
-}
-
-async fn answer_ask_paper(
-    state: &SlackState,
-    paper_query: &str,
-    question: &str,
-) -> Result<String> {
-    let mut by_source: BTreeMap<String, Vec<&RagChunk>> = BTreeMap::new();
-    for chunk in &state.rag_index.chunks {
-        if let Some(source) = chunk.source.as_deref() {
-            by_source.entry(source.to_string()).or_default().push(chunk);
-        }
-    }
-    let all_sources: Vec<String> = by_source.keys().cloned().collect();
-    let query_lower = paper_query.to_lowercase();
-    let mut matches: Vec<(String, Vec<&RagChunk>)> = by_source
-        .into_iter()
-        .filter(|(source, _)| source_matches_query(source, &query_lower))
-        .collect();
-
-    if matches.is_empty() {
-        let title_matches = state.title_index.search(paper_query);
-        if title_matches.is_empty() {
-            let mut sample = all_sources;
-            sample.truncate(8);
-            let mut message = String::from(
-                "No paper matched that query. Try a filename like 2512.04226v1.pdf or a report title.",
-            );
-            if !sample.is_empty() {
-                message.push_str("\nSample sources:\n- ");
-                message.push_str(&sample.join("\n- "));
-            }
-            return Ok(message);
-        }
-
-        let mut with_source: Vec<&TitleEntry> = title_matches
-            .iter()
-            .copied()
-            .filter(|entry| entry.source.is_some())
-            .collect();
-        if with_source.is_empty() {
-            let mut unique_titles = BTreeSet::new();
-            let mut message = String::from(
-                "Matched a report title, but the PDF is not in the RAG index. \
-Run download/ingest to add papers.\nTitles:\n- ",
-            );
-            for entry in title_matches {
-                unique_titles.insert(format_title_candidate(entry));
-            }
-            message.push_str(&unique_titles.into_iter().take(8).collect::<Vec<_>>().join("\n- "));
-            return Ok(message);
-        }
-
-        with_source.sort_by(|a, b| a.source.cmp(&b.source));
-        with_source.dedup_by(|a, b| a.source == b.source);
-        if with_source.len() > 1 {
-            let mut message =
-                String::from("Multiple papers matched that title. Please be more specific.\n- ");
-            let options: Vec<String> = with_source
-                .iter()
-                .take(8)
-                .map(|entry| format_title_candidate(entry))
-                .collect();
-            message.push_str(&options.join("\n- "));
-            return Ok(message);
-        }
-
-        let entry = with_source
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("title match disappeared"))?;
-        if let Some(source) = &entry.source {
-            matches.push((source.clone(), Vec::new()));
-        }
-    }
-
-    if matches.len() > 1 {
-        matches.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut options: Vec<String> = matches.iter().map(|(source, _)| source.clone()).collect();
-        options.truncate(8);
-        let mut message = String::from("Multiple papers matched. Please be more specific.\n- ");
-        message.push_str(&options.join("\n- "));
-        return Ok(message);
-    }
-
-    let (source, mut chunks) = matches
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("paper match disappeared"))?;
-    if chunks.is_empty() {
-        chunks = state
-            .rag_index
-            .chunks
-            .iter()
-            .filter(|chunk| chunk.source.as_deref() == Some(source.as_str()))
-            .collect();
-    }
-    build_paper_answer(state, &source, chunks, question).await
 }
 
 async fn answer_ask_paper_by_source(
@@ -1014,34 +936,48 @@ async fn build_paper_answer(
     chunks.sort_by_key(|chunk| chunk.chunk_index.unwrap_or(usize::MAX));
     let sections = build_paper_sections(&chunks, state.config.rag_paper_map_max_chars)?;
     let content_hash = paper_content_hash(&chunks);
-    let cached_summary = load_paper_summary_cache(&state.config, source, &content_hash)?;
-    let summary = if let Some(summary) = cached_summary {
-        summary
+    let question_hash = hash_string(question.as_bytes());
+    let cached_answer =
+        load_paper_summary_cache(&state.config, source, &question_hash, &content_hash)?;
+    let answer = if let Some(answer) = cached_answer {
+        answer
     } else {
-        let section_summaries =
-            summarize_paper_sections(&state.http_client, &state.config, source, &sections).await?;
-        let summary = reduce_paper_summary(
+        let section_notes = extract_question_notes(
             &state.http_client,
             &state.config,
             source,
-            &section_summaries,
+            question,
+            &sections,
         )
         .await?;
-        if let Err(err) = write_paper_summary_cache(&state.config, source, &content_hash, &summary)
-        {
+        let mut notes: Vec<String> = section_notes
+            .into_iter()
+            .filter(|note| !note_is_empty(note))
+            .collect();
+        notes.retain(|note| !note_is_not_mentioned(note));
+        let answer = if notes.is_empty() {
+            "I don't know based on the paper.".to_string()
+        } else {
+            answer_from_section_notes(
+                &state.http_client,
+                &state.config,
+                source,
+                question,
+                &notes,
+            )
+            .await?
+        };
+        if let Err(err) = write_paper_summary_cache(
+            &state.config,
+            source,
+            &question_hash,
+            &content_hash,
+            &answer,
+        ) {
             eprintln!("Failed to write paper summary cache: {err}");
         }
-        summary
+        answer
     };
-
-    let prompt = format!(
-        "You are a GPU research assistant. Use only the paper summary below. \
-If the answer is not in the summary, say you don't know.\n\n\
-Paper summary:\n{summary}\n\nQuestion: {question}\nAnswer:",
-        summary = summary,
-        question = question
-    );
-    let answer = openai_response_text(&state.http_client, &state.config, &prompt).await?;
     let title = title_for_source(&state.title_index, source);
     let context_note =
         build_paper_context_note(source, title.as_deref(), chunks.len(), sections.len());
@@ -1158,29 +1094,37 @@ fn extract_output_text(payload: &str) -> Result<String> {
     Ok(chunks.join("\n"))
 }
 
-fn build_context(matches: &[&RagChunk], max_chars: usize) -> Result<String> {
-    let mut out = String::new();
-    for (idx, chunk) in matches.iter().enumerate() {
-        let source = chunk
-            .source
-            .as_deref()
-            .unwrap_or("unknown-source");
-        let entry = format!(
-            "[{}] {} (chunk {:?})\n{}\n\n",
-            idx + 1,
-            source,
-            chunk.chunk_index,
-            chunk.text
-        );
-        if out.len() + entry.len() > max_chars {
-            break;
+fn build_sections_from_chunks(chunks: &[&RagChunk], max_chars: usize) -> Result<Vec<String>> {
+    if max_chars == 0 {
+        bail!("RAG_PAPER_MAP_MAX_CHARS must be greater than zero");
+    }
+    let mut sections = Vec::new();
+    let mut current = String::new();
+    for chunk in chunks {
+        let text = chunk.text.trim();
+        if text.is_empty() {
+            continue;
         }
-        out.push_str(&entry);
+        if current.is_empty() && text.len() > max_chars {
+            sections.extend(split_text(text, max_chars));
+            continue;
+        }
+        if !current.is_empty() && current.len() + text.len() + 2 > max_chars {
+            sections.push(current.trim().to_string());
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(text);
     }
-    if out.trim().is_empty() {
-        bail!("context empty after truncation");
+    if !current.trim().is_empty() {
+        sections.push(current.trim().to_string());
     }
-    Ok(out)
+    if sections.is_empty() {
+        bail!("context sections empty");
+    }
+    Ok(sections)
 }
 
 fn build_context_note(matches: &[&RagChunk]) -> String {
@@ -1210,25 +1154,6 @@ fn normalize_title(value: &str) -> String {
         }
     }
     out
-}
-
-fn format_title_candidate(entry: &TitleEntry) -> String {
-    match (&entry.arxiv_id, &entry.source) {
-        (Some(_arxiv_id), Some(source)) => format!("{} ({})", entry.title, source),
-        (Some(arxiv_id), None) => format!("{} (arXiv {})", entry.title, arxiv_id),
-        _ => entry.title.clone(),
-    }
-}
-
-fn source_matches_query(source: &str, query_lower: &str) -> bool {
-    let source_lower = source.to_lowercase();
-    if source_lower.contains(query_lower) {
-        return true;
-    }
-    if let Some(name) = Path::new(source).file_name().and_then(|name| name.to_str()) {
-        return name.to_lowercase().contains(query_lower);
-    }
-    false
 }
 
 fn title_for_source(title_index: &TitleIndex, source: &str) -> Option<String> {
@@ -1325,31 +1250,35 @@ fn split_text(text: &str, max_chars: usize) -> Vec<String> {
     parts
 }
 
-async fn summarize_paper_sections(
+async fn extract_question_notes(
     client: &HttpClient,
     config: &Config,
     source: &str,
+    question: &str,
     sections: &[String],
 ) -> Result<Vec<String>> {
     let total = sections.len();
     let concurrency = config.rag_paper_map_concurrency.max(1);
     if concurrency == 1 {
-        let mut summaries = Vec::new();
+        let mut notes = Vec::new();
         for (idx, section) in sections.iter().enumerate() {
             let prompt = format!(
-                "You are summarizing section {part} of {total} from paper {source}. \
-Extract the motivation, problem statement, approach, key results, and limitations. \
-Keep it concise and factual. Use short bullet points.\n\n\
-Section text:\n{section}\n\nSummary:",
+                "You are extracting evidence to answer a question about paper {source}. \
+Question: {question}\n\
+From section {part} of {total}, extract only information relevant to the question. \
+If the section does not mention the answer, reply \"Not mentioned.\" \
+Use short bullet points and avoid speculation.\n\n\
+Section text:\n{section}\n\nNotes:",
                 part = idx + 1,
                 total = total,
                 source = source,
+                question = question,
                 section = section
             );
-            let summary = openai_response_text(client, config, &prompt).await?;
-            summaries.push(summary);
+            let note = openai_response_text(client, config, &prompt).await?;
+            notes.push(note);
         }
-        return Ok(summaries);
+        return Ok(notes);
     }
 
     let sem = Arc::new(Semaphore::new(concurrency));
@@ -1363,59 +1292,73 @@ Section text:\n{section}\n\nSummary:",
         let client = client.clone();
         let config = config.clone();
         let source = source.to_string();
+        let question = question.to_string();
         let section = section.clone();
         set.spawn(async move {
             let _permit = permit;
             let prompt = format!(
-                "You are summarizing section {part} of {total} from paper {source}. \
-Extract the motivation, problem statement, approach, key results, and limitations. \
-Keep it concise and factual. Use short bullet points.\n\n\
-Section text:\n{section}\n\nSummary:",
+                "You are extracting evidence to answer a question about paper {source}. \
+Question: {question}\n\
+From section {part} of {total}, extract only information relevant to the question. \
+If the section does not mention the answer, reply \"Not mentioned.\" \
+Use short bullet points and avoid speculation.\n\n\
+Section text:\n{section}\n\nNotes:",
                 part = idx + 1,
                 total = total,
                 source = source,
+                question = question,
                 section = section
             );
-            let summary = openai_response_text(&client, &config, &prompt).await?;
-            Ok::<_, anyhow::Error>((idx, summary))
+            let note = openai_response_text(&client, &config, &prompt).await?;
+            Ok::<_, anyhow::Error>((idx, note))
         });
     }
 
-    let mut summaries = Vec::with_capacity(total);
+    let mut notes = Vec::with_capacity(total);
     while let Some(result) = set.join_next().await {
         let item = result.context("join summary task")??;
-        summaries.push(item);
+        notes.push(item);
     }
-    summaries.sort_by_key(|(idx, _)| *idx);
-    Ok(summaries.into_iter().map(|(_, summary)| summary).collect())
+    notes.sort_by_key(|(idx, _)| *idx);
+    Ok(notes.into_iter().map(|(_, note)| note).collect())
 }
 
-async fn reduce_paper_summary(
+async fn answer_from_section_notes(
     client: &HttpClient,
     config: &Config,
     source: &str,
-    summaries: &[String],
+    question: &str,
+    notes: &[String],
 ) -> Result<String> {
-    if summaries.is_empty() {
-        bail!("paper summary sections missing");
+    if notes.is_empty() {
+        bail!("paper notes missing");
     }
-    let combined = summaries.join("\n\n");
-    if combined.len() <= config.rag_paper_reduce_max_chars {
-        return Ok(combined);
-    }
+    let combined = truncate_text(&notes.join("\n\n"), config.rag_paper_reduce_max_chars);
     let prompt = format!(
-        "You are given section summaries for paper {source}. Merge them into a compact \
-summary under {limit} characters. Include motivation, approach, results, and limitations. \
-Use short bullet points.\n\nSummaries:\n{combined}\n\nCondensed summary:",
+        "You are answering a question about paper {source} using only the notes below. \
+If the notes do not contain the answer, say you don't know.\n\n\
+Question: {question}\n\nNotes:\n{combined}\n\nAnswer:",
         source = source,
-        limit = config.rag_paper_reduce_max_chars,
+        question = question,
         combined = combined
     );
-    let condensed = openai_response_text(client, config, &prompt).await?;
-    Ok(truncate_text(
-        &condensed,
-        config.rag_paper_reduce_max_chars,
-    ))
+    let answer = openai_response_text(client, config, &prompt).await?;
+    Ok(answer)
+}
+
+fn note_is_empty(note: &str) -> bool {
+    note.trim().is_empty()
+}
+
+fn note_is_not_mentioned(note: &str) -> bool {
+    let trimmed = note
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    matches!(
+        trimmed.as_str(),
+        "not mentioned" | "no relevant info" | "no relevant information"
+    )
 }
 
 fn paper_content_hash(chunks: &[&RagChunk]) -> String {
@@ -1459,12 +1402,12 @@ fn sanitize_cache_key(value: &str) -> String {
     }
 }
 
-fn cache_path_for_source(config: &Config, source: &str) -> Result<String> {
+fn cache_path_for_question(config: &Config, source: &str, question_hash: &str) -> Result<String> {
     let dir = config.rag_paper_summary_cache_dir.trim();
     if dir.is_empty() {
         bail!("RAG_PAPER_SUMMARY_CACHE_DIR is empty");
     }
-    let filename = format!("{}.json", sanitize_cache_key(source));
+    let filename = format!("{}_{}.json", sanitize_cache_key(source), question_hash);
     Ok(Path::new(dir)
         .join(filename)
         .to_string_lossy()
@@ -1481,12 +1424,13 @@ fn now_unix_seconds() -> Result<u64> {
 fn load_paper_summary_cache(
     config: &Config,
     source: &str,
+    question_hash: &str,
     content_hash: &str,
 ) -> Result<Option<String>> {
     if config.rag_paper_summary_cache_dir.trim().is_empty() {
         return Ok(None);
     }
-    let path = cache_path_for_source(config, source)?;
+    let path = cache_path_for_question(config, source, question_hash)?;
     let payload = match fs::read_to_string(&path) {
         Ok(value) => value,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1495,6 +1439,7 @@ fn load_paper_summary_cache(
     let cache: PaperSummaryCache =
         serde_json::from_str(&payload).context("parse paper summary cache")?;
     if cache.source != source
+        || cache.question_hash != question_hash
         || cache.content_hash != content_hash
         || cache.model != config.openai_chat_model
         || cache.map_max_chars != config.rag_paper_map_max_chars
@@ -1509,32 +1454,34 @@ fn load_paper_summary_cache(
             return Ok(None);
         }
     }
-    if cache.summary.trim().is_empty() {
+    if cache.answer.trim().is_empty() {
         return Ok(None);
     }
-    Ok(Some(cache.summary))
+    Ok(Some(cache.answer))
 }
 
 fn write_paper_summary_cache(
     config: &Config,
     source: &str,
+    question_hash: &str,
     content_hash: &str,
-    summary: &str,
+    answer: &str,
 ) -> Result<()> {
     let dir = config.rag_paper_summary_cache_dir.trim();
     if dir.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(dir).with_context(|| format!("create {dir}"))?;
-    let path = cache_path_for_source(config, source)?;
+    let path = cache_path_for_question(config, source, question_hash)?;
     let cache = PaperSummaryCache {
         source: source.to_string(),
+        question_hash: question_hash.to_string(),
         content_hash: content_hash.to_string(),
         model: config.openai_chat_model.clone(),
         map_max_chars: config.rag_paper_map_max_chars,
         reduce_max_chars: config.rag_paper_reduce_max_chars,
         created_at: now_unix_seconds()?,
-        summary: summary.to_string(),
+        answer: answer.to_string(),
     };
     let payload = serde_json::to_string(&cache).context("serialize paper summary cache")?;
     fs::write(&path, payload).with_context(|| format!("write cache {path}"))?;

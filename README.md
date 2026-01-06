@@ -63,8 +63,8 @@ cargo run --bin discord_bot
 
 The bot logs each `/ask` request to stdout and replies with section headings for Paper, Question, Answer, and Context. `/ask_paper` includes the paper title when available.
 `/ask_paper` title matching is built from the report markdown files in `REPORTS_DIR`.
-Per-paper summaries are cached under `RAG_PAPER_SUMMARY_CACHE_DIR` to speed up repeat queries.
-Use `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` to expire cached summaries (0 disables expiry).
+Cached `/ask_paper` outputs are stored under `RAG_PAPER_SUMMARY_CACHE_DIR` to speed up repeat queries.
+Use `RAG_PAPER_SUMMARY_CACHE_TTL_SECS` to expire cached outputs (0 disables expiry).
 
 ### Commands
 
@@ -121,8 +121,8 @@ cargo run --bin slack_bot
 
 ### Commands
 
-- `/ask <question>` answers using top-K retrieved chunks.
-- `/ask_paper` opens a modal with paper autocomplete and a question field, then answers from the full paper via map-reduce.
+- `/ask <question>` answers using top-K retrieved chunks with question-aware reduction.
+- `/ask_paper` opens a modal with paper autocomplete and a question field, then answers via question-aware map-reduce over the full paper.
 - `/papers [filter]` lists available papers in the RAG index. Provide an optional filter to narrow by title or filename.
 - `/sync` triggers the user-level RAG sync service to pull the latest artifacts and restart the bot.
 Slack replies use plain text labels (`Paper`, `Question`, `Answer`, `Context`) for reliable formatting.
