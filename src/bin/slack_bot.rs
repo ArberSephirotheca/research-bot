@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     fs::{self, File},
     io::{BufRead, BufReader},
@@ -221,6 +221,8 @@ impl TitleIndex {
 struct PaperEntry {
     source: String,
     title: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
     label: String,
     value: String,
 }
@@ -228,7 +230,31 @@ struct PaperEntry {
 struct PaperIndex {
     entries: Vec<PaperEntry>,
     value_to_source: HashMap<String, String>,
+    category_counts: BTreeMap<String, usize>,
+    tag_counts: BTreeMap<String, usize>,
 }
+
+const UNCATEGORIZED_LABEL: &str = "Uncategorized";
+
+struct TagRule {
+    name: &'static str,
+    keywords: &'static [&'static str],
+}
+
+const TAG_RULES: &[TagRule] = &[
+    TagRule {
+        name: "compiler",
+        keywords: &["compiler", "codegen", "code generation", "autotuning", "llvm"],
+    },
+    TagRule {
+        name: "mlir",
+        keywords: &["mlir"],
+    },
+    TagRule {
+        name: "triton",
+        keywords: &["triton"],
+    },
+];
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PaperSummaryCache {
@@ -287,7 +313,14 @@ async fn main() -> Result<()> {
             TitleIndex::empty()
         }
     };
-    let paper_index = build_paper_index(&rag_index, &title_index);
+    let report_categories = match load_report_categories(&config) {
+        Ok(categories) => categories,
+        Err(err) => {
+            eprintln!("Failed to load report categories: {err}");
+            HashMap::new()
+        }
+    };
+    let paper_index = build_paper_index(&rag_index, &title_index, &report_categories);
     let http_client = HttpClient::builder()
         .user_agent("research-bot-slack/0.1")
         .build()
@@ -423,14 +456,26 @@ async fn handle_slash_command(state: Arc<SlackState>, payload: SlackSlashPayload
             .await?;
         }
         "/papers" => {
-            let response = list_available_papers(&state, text);
-            post_slack_response(
-                &state.http_client,
-                &payload.response_url,
-                &response,
-                &state.config.slack_response_type,
-            )
-            .await?;
+            let responses = list_available_papers(&state, text);
+            let mut iterator = responses.into_iter();
+            if let Some(first) = iterator.next() {
+                post_slack_response(
+                    &state.http_client,
+                    &payload.response_url,
+                    &first,
+                    &state.config.slack_response_type,
+                )
+                .await?;
+                for message in iterator {
+                    post_slack_response_followup(
+                        &state.http_client,
+                        &payload.response_url,
+                        &message,
+                        &state.config.slack_response_type,
+                    )
+                    .await?;
+                }
+            }
         }
         "/ask_paper" => {
             let trigger_id = match payload.trigger_id.as_deref() {
@@ -518,48 +563,280 @@ fn trim_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }
 
-fn list_available_papers(state: &SlackState, query: &str) -> String {
-    let query = query.trim();
+enum PapersQuery {
+    All(Option<String>),
+    Categories,
+    CategoryFilter(String),
+    Tags,
+    TagFilter(String),
+    TextFilter(String),
+}
+
+fn parse_papers_query(query: &str) -> PapersQuery {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return PapersQuery::TextFilter(String::new());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "all" {
+        return PapersQuery::All(None);
+    }
+    if lower.starts_with("all ") {
+        let filter = trimmed.get(4..).unwrap_or("").trim();
+        return PapersQuery::All(Some(filter.to_string()));
+    }
+    if lower == "categories" || lower == "category" {
+        return PapersQuery::Categories;
+    }
+    if lower == "tags" || lower == "tag" {
+        return PapersQuery::Tags;
+    }
+    if lower.starts_with("category:") {
+        let filter = trimmed.get(9..).unwrap_or("").trim();
+        if filter.is_empty() {
+            return PapersQuery::Categories;
+        }
+        return PapersQuery::CategoryFilter(filter.to_string());
+    }
+    if lower.starts_with("tag:") {
+        let filter = trimmed.get(4..).unwrap_or("").trim();
+        if filter.is_empty() {
+            return PapersQuery::Tags;
+        }
+        return PapersQuery::TagFilter(filter.to_string());
+    }
+    if lower.starts_with("cat:") {
+        let filter = trimmed.get(4..).unwrap_or("").trim();
+        if filter.is_empty() {
+            return PapersQuery::Categories;
+        }
+        return PapersQuery::CategoryFilter(filter.to_string());
+    }
+    if lower.starts_with("category ") {
+        let filter = trimmed.get(9..).unwrap_or("").trim();
+        if filter.is_empty() {
+            return PapersQuery::Categories;
+        }
+        return PapersQuery::CategoryFilter(filter.to_string());
+    }
+    if lower.starts_with("tag ") {
+        let filter = trimmed.get(4..).unwrap_or("").trim();
+        if filter.is_empty() {
+            return PapersQuery::Tags;
+        }
+        return PapersQuery::TagFilter(filter.to_string());
+    }
+    if lower.starts_with("cat ") {
+        let filter = trimmed.get(4..).unwrap_or("").trim();
+        if filter.is_empty() {
+            return PapersQuery::Categories;
+        }
+        return PapersQuery::CategoryFilter(filter.to_string());
+    }
+    PapersQuery::TextFilter(trimmed.to_string())
+}
+
+fn list_available_papers(state: &SlackState, query: &str) -> Vec<String> {
+    match parse_papers_query(query) {
+        PapersQuery::Categories => list_paper_categories(state),
+        PapersQuery::CategoryFilter(category) => list_papers_by_category(state, &category),
+        PapersQuery::Tags => list_paper_tags(state),
+        PapersQuery::TagFilter(tag) => list_papers_by_tag(state, &tag),
+        PapersQuery::All(filter) => list_papers_filtered(state, filter.as_deref(), None),
+        PapersQuery::TextFilter(filter) => list_papers_filtered(state, Some(&filter), Some(30)),
+    }
+}
+
+fn list_paper_categories(state: &SlackState) -> Vec<String> {
+    if state.paper_index.category_counts.is_empty() {
+        return vec!["No categories found in the reports yet.".to_string()];
+    }
+    let mut lines = Vec::new();
+    for (category, count) in &state.paper_index.category_counts {
+        lines.push(format!("- {} ({})", category, count));
+    }
+    let header = format!(
+        "Available categories ({}). Use /papers category:<name> to list papers.",
+        lines.len()
+    );
+    paginate_lines_with_header(&lines, &header, state.config.ask_max_response_chars)
+}
+
+fn list_paper_tags(state: &SlackState) -> Vec<String> {
+    if state.paper_index.tag_counts.is_empty() {
+        return vec!["No tags matched any papers.".to_string()];
+    }
+    let mut lines = Vec::new();
+    for (tag, count) in &state.paper_index.tag_counts {
+        lines.push(format!("- {} ({})", tag, count));
+    }
+    let header = format!(
+        "Available tags ({}). Use /papers tag:<name> to list papers.",
+        lines.len()
+    );
+    paginate_lines_with_header(&lines, &header, state.config.ask_max_response_chars)
+}
+
+fn list_papers_by_category(state: &SlackState, category_query: &str) -> Vec<String> {
+    let query = category_query.trim();
+    if query.is_empty() {
+        return list_paper_categories(state);
+    }
+    let mut entries: Vec<&PaperEntry> = state
+        .paper_index
+        .entries
+        .iter()
+        .filter(|entry| category_matches(entry, query))
+        .collect();
+    entries.sort_by(|a, b| a.label.cmp(&b.label).then(a.source.cmp(&b.source)));
+
+    let total = entries.len();
+    if total == 0 {
+        return vec![format!(
+            "No papers matched category \"{}\". Use /papers categories to list categories.",
+            query
+        )];
+    }
+    let mut lines = Vec::with_capacity(total);
+    for entry in entries {
+        lines.push(paper_entry_line(entry));
+    }
+    let header = format!(
+        "Papers in categories matching \"{}\" (total: {}).",
+        query, total
+    );
+    paginate_lines_with_header(&lines, &header, state.config.ask_max_response_chars)
+}
+
+fn list_papers_by_tag(state: &SlackState, tag_query: &str) -> Vec<String> {
+    let query = tag_query.trim();
+    if query.is_empty() {
+        return list_paper_tags(state);
+    }
+    let mut entries: Vec<&PaperEntry> = state
+        .paper_index
+        .entries
+        .iter()
+        .filter(|entry| tag_matches(entry, query))
+        .collect();
+    entries.sort_by(|a, b| a.label.cmp(&b.label).then(a.source.cmp(&b.source)));
+
+    let total = entries.len();
+    if total == 0 {
+        return vec![format!(
+            "No papers matched tag \"{}\". Use /papers tags to list tags.",
+            query
+        )];
+    }
+    let mut lines = Vec::with_capacity(total);
+    for entry in entries {
+        lines.push(paper_entry_line(entry));
+    }
+    let header = format!("Papers tagged \"{}\" (total: {}).", query, total);
+    paginate_lines_with_header(&lines, &header, state.config.ask_max_response_chars)
+}
+
+fn list_papers_filtered(
+    state: &SlackState,
+    query: Option<&str>,
+    limit: Option<usize>,
+) -> Vec<String> {
+    let query = query.unwrap_or("").trim();
     let mut entries: Vec<&PaperEntry> = state.paper_index.entries.iter().collect();
     if !query.is_empty() {
         entries.retain(|entry| paper_matches_query(entry, query));
     }
-
     entries.sort_by(|a, b| a.label.cmp(&b.label).then(a.source.cmp(&b.source)));
 
     let total = entries.len();
     if total == 0 {
         if query.is_empty() {
-            return "No papers found in the RAG index.".to_string();
+            return vec!["No papers found in the RAG index.".to_string()];
         }
-        return format!("No papers matched \"{}\".", query);
+        return vec![format!("No papers matched \"{}\".", query)];
     }
 
-    let max_items = 30usize;
-    let shown = std::cmp::min(total, max_items);
+    let shown = limit.map(|limit| std::cmp::min(total, limit)).unwrap_or(total);
     let mut lines = Vec::with_capacity(shown);
     for entry in entries.into_iter().take(shown) {
-        if let Some(title) = &entry.title {
-            lines.push(format!("- {} ({})", title, entry.source));
-        } else {
-            lines.push(format!("- {}", entry.source));
-        }
+        lines.push(paper_entry_line(entry));
     }
 
     let mut header = if query.is_empty() {
-        format!("Available papers (total: {total}). Showing {shown}:")
+        format!("Available papers (total: {total}).")
     } else {
-        format!(
-            "Matched papers for \"{}\" (total: {total}). Showing {shown}:",
-            query
-        )
+        format!("Matched papers for \"{}\" (total: {total}).", query)
     };
-    if shown < total {
-        header.push_str(" Use /papers <filter> to narrow.");
+    if let Some(_) = limit {
+        header.push_str(&format!(" Showing {shown}."));
+        if shown < total {
+            if query.is_empty() {
+                header.push_str(" Use /papers all to show everything.");
+            } else {
+                header.push_str(&format!(" Use /papers all {} to show everything.", query));
+            }
+        }
+    }
+    header.push_str(" Use /papers categories or /papers tags to list categories.");
+
+    paginate_lines_with_header(&lines, &header, state.config.ask_max_response_chars)
+}
+
+fn paper_entry_line(entry: &PaperEntry) -> String {
+    if let Some(title) = &entry.title {
+        format!("- {} ({})", title, entry.source)
+    } else {
+        format!("- {}", entry.source)
+    }
+}
+
+fn paginate_lines_with_header(
+    lines: &[String],
+    header: &str,
+    max_chars: usize,
+) -> Vec<String> {
+    if lines.is_empty() {
+        return vec![truncate_text(header, max_chars)];
+    }
+    let page_overhead = 16usize;
+    let max_body_chars = max_chars.saturating_sub(header.len() + page_overhead + 1);
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_len = 0usize;
+    for line in lines {
+        let line_len = line.len();
+        let next_len = if current.is_empty() {
+            line_len
+        } else {
+            current_len + 1 + line_len
+        };
+        if !current.is_empty() && next_len > max_body_chars {
+            pages.push(current);
+            current = Vec::new();
+            current_len = 0;
+        }
+        current_len = if current.is_empty() {
+            line_len
+        } else {
+            current_len + 1 + line_len
+        };
+        current.push(line.clone());
+    }
+    if !current.is_empty() {
+        pages.push(current);
     }
 
-    let message = format!("{}\n{}", header, lines.join("\n"));
-    truncate_text(&message, state.config.ask_max_response_chars)
+    let total_pages = pages.len();
+    let mut messages = Vec::with_capacity(total_pages);
+    for (idx, page) in pages.into_iter().enumerate() {
+        let mut header_line = header.to_string();
+        if total_pages > 1 {
+            header_line.push_str(&format!(" Page {}/{}.", idx + 1, total_pages));
+        }
+        let message = format!("{}\n{}", header_line, page.join("\n"));
+        messages.push(truncate_text(&message, max_chars));
+    }
+    messages
 }
 
 fn is_paper_source(source: &str) -> bool {
@@ -722,6 +999,34 @@ async fn post_slack_response(
         .context("send slack response")?;
     let status = response.status();
     let body = response.text().await.context("read slack response body")?;
+    if !status.is_success() {
+        bail!("slack response error: {} {}", status, body);
+    }
+    Ok(())
+}
+
+async fn post_slack_response_followup(
+    client: &HttpClient,
+    response_url: &str,
+    text: &str,
+    response_type: &str,
+) -> Result<()> {
+    let payload = json!({
+        "response_type": response_type,
+        "replace_original": false,
+        "text": text,
+    });
+    let response = client
+        .post(response_url)
+        .json(&payload)
+        .send()
+        .await
+        .context("send slack followup response")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("read slack followup response body")?;
     if !status.is_success() {
         bail!("slack response error: {} {}", status, body);
     }
@@ -1558,6 +1863,79 @@ fn safe_filename(arxiv_id: &str) -> String {
     format!("{}.pdf", arxiv_id.replace('/', "_"))
 }
 
+fn tags_for_entry(source: &str, title: Option<&str>) -> Vec<String> {
+    let mut haystack = String::new();
+    if let Some(title) = title {
+        haystack.push_str(title);
+        haystack.push(' ');
+    }
+    haystack.push_str(source);
+    let haystack = haystack.to_lowercase();
+
+    let mut tags = BTreeSet::new();
+    for rule in TAG_RULES {
+        if rule
+            .keywords
+            .iter()
+            .any(|keyword| haystack.contains(&keyword.to_lowercase()))
+        {
+            tags.insert(rule.name.to_string());
+        }
+    }
+    tags.into_iter().collect()
+}
+
+fn parse_report_heading(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let heading = line
+        .strip_prefix("### ")
+        .or_else(|| line.strip_prefix("## "))?;
+    let heading = heading.trim();
+    if heading.is_empty() {
+        return None;
+    }
+    let heading = heading.split(" (").next().unwrap_or(heading).trim();
+    if heading.is_empty() {
+        return None;
+    }
+    Some(heading.to_string())
+}
+
+fn load_report_categories(config: &Config) -> Result<HashMap<String, String>> {
+    if !Path::new(&config.reports_dir).is_dir() {
+        return Ok(HashMap::new());
+    }
+    let report_files = list_report_files(&config.reports_dir)?;
+    if report_files.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut categories = HashMap::new();
+    for path in report_files.iter().rev() {
+        let content = fs::read_to_string(path).with_context(|| format!("read report {path}"))?;
+        let mut current_category: Option<String> = None;
+        for line in content.lines() {
+            if let Some(category) = parse_report_heading(line) {
+                current_category = Some(category);
+                continue;
+            }
+            let Some((_title, url)) = extract_markdown_link(line) else {
+                continue;
+            };
+            let Some(arxiv_id) = extract_arxiv_id(&url) else {
+                continue;
+            };
+            let Some(category) = current_category.as_ref() else {
+                continue;
+            };
+            let source = format!("papers/{}", safe_filename(&arxiv_id));
+            categories.entry(source).or_insert_with(|| category.clone());
+        }
+    }
+
+    Ok(categories)
+}
+
 fn load_title_index(config: &Config, rag_index: &EmbeddingsIndex) -> Result<TitleIndex> {
     if !Path::new(&config.reports_dir).is_dir() {
         println!("reports dir not found: {}", config.reports_dir);
@@ -1614,7 +1992,11 @@ fn load_title_index(config: &Config, rag_index: &EmbeddingsIndex) -> Result<Titl
     Ok(TitleIndex { entries })
 }
 
-fn build_paper_index(rag_index: &EmbeddingsIndex, title_index: &TitleIndex) -> PaperIndex {
+fn build_paper_index(
+    rag_index: &EmbeddingsIndex,
+    title_index: &TitleIndex,
+    report_categories: &HashMap<String, String>,
+) -> PaperIndex {
     let mut sources = BTreeSet::new();
     for chunk in &rag_index.chunks {
         if let Some(source) = chunk.source.as_deref() {
@@ -1626,21 +2008,41 @@ fn build_paper_index(rag_index: &EmbeddingsIndex, title_index: &TitleIndex) -> P
 
     let mut entries = Vec::new();
     let mut value_to_source = HashMap::new();
+    let mut category_counts = BTreeMap::new();
+    let mut tag_counts = BTreeMap::new();
+    let mut uncategorized = 0usize;
     for source in sources {
         let title = title_for_source(title_index, &source);
+        let category = report_categories.get(&source).cloned();
+        let tags = tags_for_entry(&source, title.as_deref());
         let label = paper_label(&source, title.as_deref());
         let value = paper_value_for_source(&source);
         value_to_source.insert(value.clone(), source.clone());
+        if let Some(category) = &category {
+            *category_counts.entry(category.clone()).or_insert(0) += 1;
+        } else {
+            uncategorized += 1;
+        }
+        for tag in &tags {
+            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+        }
         entries.push(PaperEntry {
             source,
             title,
+            category,
+            tags,
             label,
             value,
         });
     }
+    if uncategorized > 0 {
+        category_counts.insert(UNCATEGORIZED_LABEL.to_string(), uncategorized);
+    }
     PaperIndex {
         entries,
         value_to_source,
+        category_counts,
+        tag_counts,
     }
 }
 
@@ -1684,9 +2086,45 @@ fn paper_options_for_query(index: &PaperIndex, query: &str) -> Vec<serde_json::V
         .collect()
 }
 
+fn category_matches(entry: &PaperEntry, query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+    if query_lower.is_empty() {
+        return false;
+    }
+    if let Some(category) = &entry.category {
+        return category.to_lowercase().contains(&query_lower);
+    }
+    query_lower == UNCATEGORIZED_LABEL.to_lowercase()
+}
+
+fn tag_matches(entry: &PaperEntry, query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+    if query_lower.is_empty() {
+        return false;
+    }
+    entry
+        .tags
+        .iter()
+        .any(|tag| tag.to_lowercase().contains(&query_lower))
+}
+
 fn paper_matches_query(entry: &PaperEntry, query: &str) -> bool {
     let query_lower = query.to_lowercase();
     if entry.source.to_lowercase().contains(&query_lower) {
+        return true;
+    }
+    if let Some(category) = &entry.category {
+        if category.to_lowercase().contains(&query_lower) {
+            return true;
+        }
+    } else if query_lower == UNCATEGORIZED_LABEL.to_lowercase() {
+        return true;
+    }
+    if entry
+        .tags
+        .iter()
+        .any(|tag| tag.to_lowercase().contains(&query_lower))
+    {
         return true;
     }
     let query_norm = normalize_title(query);

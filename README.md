@@ -123,7 +123,7 @@ cargo run --bin slack_bot
 
 - `/ask <question>` answers using top-K retrieved chunks with question-aware reduction.
 - `/ask_paper` opens a modal with paper autocomplete and a question field, then answers via question-aware map-reduce over the full paper.
-- `/papers [filter]` lists available papers in the RAG index. Provide an optional filter to narrow by title or filename.
+- `/papers [filter]` lists available papers (up to 30). Use `/papers all` to show everything, `/papers all <filter>` for full filtered lists, `/papers categories` for report categories, `/papers category:<name>` to list by category, `/papers tags` for keyword tags, or `/papers tag:<name>` to list by tag.
 - `/sync` triggers the user-level RAG sync service to pull the latest artifacts and restart the bot.
 Slack replies use plain text labels (`Paper`, `Question`, `Answer`, `Context`) for reliable formatting.
 
